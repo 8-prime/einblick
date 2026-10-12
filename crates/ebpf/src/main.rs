@@ -24,14 +24,17 @@ impl PacketRead for XdpPacket {
         // Keep the pointer calculation, check and load in one opaque block.
         // LLVM can otherwise merge checks for different offsets, then rebuild
         // a pointer whose bounds the verifier no longer knows (notably after
-        // IPv6 extension headers). 256 represents a failed one-byte read.
+        // IPv6 extension headers). Check pointer + 1 with a fixed offset:
+        // checking pointer < data_end alone leaves variable pointers with a
+        // zero readable range in the verifier. 256 represents a failed read.
         let value: u64;
         unsafe {
             core::arch::asm!(
                 "{value} = 256",
                 "{pointer} += {offset}",
-                "if {pointer} >= {end} goto +1",
-                "{value} = *(u8 *)({pointer} + 0)",
+                "{pointer} += 1",
+                "if {pointer} > {end} goto +1",
+                "{value} = *(u8 *)({pointer} - 1)",
                 value = out(reg) value,
                 pointer = inout(reg) self.start => _,
                 offset = in(reg) at,

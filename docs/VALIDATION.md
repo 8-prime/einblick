@@ -2,7 +2,7 @@
 
 ## Passed locally
 
-- Rust workspace: **18 tests passed**, one privileged kernel test explicitly ignored.
+- Rust workspace: **22 tests passed**, one privileged kernel test explicitly ignored.
 - Targeted API regression: authentication, Origin/CSRF checks, logout, and asset-path
   traversal rejection passed.
 - `cargo fmt --all -- --check` and Clippy with warnings denied passed.
@@ -107,17 +107,31 @@ length, but the emitted TCP port load used a newly constructed packet pointer
 with no known accessible range. A scalar IP-length comparison does not establish
 a packet-pointer range for that load.
 
-The XDP byte reader now puts its pointer addition, `pointer >= data_end` branch
-and byte load in one inline assembly block. A failed check returns a sentinel
-that becomes `None`; the shared parser continues to report incomplete evidence.
-LLVM cannot merge these checks or separate them from their loads. Inspection of
-the rebuilt ELF found 53 non-stack byte loads, each immediately preceded by a
-guard comparing the same pointer register with `data_end` and skipping that
-load on failure. The object compiled and passed embedding validation.
+The first inline assembly reader kept the pointer addition, comparison and byte
+load together, but used `pointer >= data_end` to skip a load at offset zero.
+The subsequent `invalid access to packet, off=0 size=1` rejection exposed a second
+issue: for a variable-offset pointer with fixed offset zero, Linux's
+[range inference](https://github.com/torvalds/linux/blob/v6.1/kernel/bpf/verifier.c#L8879-L8901)
+does not infer a readable range from that comparison.
+
+The corrected reader adds the variable offset, then a fixed one byte, skips the
+load when `pointer > data_end`, and loads at `pointer - 1`. That establishes the
+one-byte range needed by the load. The whole sequence stays in one inline
+assembly block so LLVM cannot separate or merge the check and load. A failed
+check returns a sentinel that becomes `None`; the shared parser still reports
+incomplete evidence. Inspection of the rebuilt ELF found all 53 non-stack byte
+loads use this fixed-width pattern.
+
+Embedding validation now enforces this reader pattern for ingress byte loads
+outside the stack. It checks the fixed increment, matching pointer register,
+comparison, skip distance, and load offset. Tests cover the previous zero-range
+pattern and incorrect width/register/branch variants in both ELF byte orders.
+An embedding build rejected the previous real object and accepted the rebuilt
+object. This is a structural check, not a full kernel pointer-provenance proof.
 
 The kernel harness now injects a TCP SYN after four differently sized IPv6
 extension headers and verifies both its event and source blocking. The fixture
-and every truncation passed the shared parser regression test. All 20 workspace
+and every truncation passed the shared parser regression test. All 22 workspace
 tests and Clippy passed (the privileged kernel test was skipped). The release
 binary built with this object. An attempted isolated kernel run stopped at
 `sudo: a password is required`, so runtime acceptance remains unverified.
