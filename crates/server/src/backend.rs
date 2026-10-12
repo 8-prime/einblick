@@ -314,7 +314,7 @@ impl Kernel {
             .try_into()?;
         program
             .load()
-            .context("XDP verifier rejected program, or CAP_BPF/CAP_NET_ADMIN is unavailable")?;
+            .context("XDP load/verifier failed: live capture requires CAP_BPF, CAP_NET_ADMIN and CAP_PERFMON (for packet-pointer arithmetic), plus a permitted bpf syscall")?;
         let banks = [Bank::take(&mut bpf, "A")?, Bank::take(&mut bpf, "B")?];
         Ok(Self {
             metrics: PerCpuArray::try_from(bpf.take_map("METRICS").unwrap())?,

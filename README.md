@@ -62,9 +62,11 @@ docker compose up --build -d
 docker compose logs -f einblick
 ```
 
-The container uses host networking, `CAP_BPF` and `CAP_NET_ADMIN`, unlimited
-memlock, a read-only root filesystem, and one writable `/data` volume. It does not
-require privileged mode, bpffs pinning, or an external database. Compose relaxes
+The container uses host networking, `CAP_BPF`, `CAP_NET_ADMIN` and `CAP_PERFMON`,
+unlimited memlock, a read-only root filesystem, and one writable `/data` volume.
+`CAP_PERFMON` permits the verifier's packet-pointer arithmetic used by the parser
+on supported kernels. It does not require privileged mode, bpffs pinning, or an
+external database. Compose relaxes
 seccomp because Docker's default profile can deny the BPF syscall; capabilities
 and `no-new-privileges` still apply. SELinux/AppArmor policies must also permit
 BPF loading and network attachment. Startup errors explain missing permissions,
@@ -209,9 +211,10 @@ The isolated kernel harness covers verifier loading/attachment, IPv4/IPv6 and
 VLAN/fragment source blocking, SYN events, allowlist precedence, expiry without
 userspace cleanup, emergency disable, attachment conflict, and SIGKILL cleanup.
 It refuses to run in the host network namespace and uses `setpriv` to load XDP
-with the production capability restrictions (no `CAP_PERFMON`/`CAP_SYS_ADMIN`;
-the packet injector additionally needs `CAP_NET_RAW`). The mock HTTP test covers
-sessions, manual rules, mode persistence, SSE shutdown, restoration, history,
+with the production capabilities (`CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON`,
+without `CAP_SYS_ADMIN`; the packet injector additionally needs `CAP_NET_RAW`).
+The mock HTTP test covers sessions, manual rules, mode persistence, SSE shutdown,
+restoration, history,
 audit, and emergency disable. CI runs Rust/Svelte checks, builds the image, and runs the isolated kernel and mock HTTP tests on its privileged runner.
 
 For performance acceptance, benchmark native XDP on a two-vCPU Linux host with an

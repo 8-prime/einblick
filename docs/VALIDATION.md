@@ -82,9 +82,23 @@ stores. This setting applies to Docker and local Cargo builds alike.
 
 The embedding validator rejects references to memory fallback functions while
 allowing their unused exported definitions. An ELF regression test covers that
-distinction for memset, memcpy, memmove, memcmp, and bcmp. The privileged harness
-now drops `CAP_PERFMON` and `CAP_SYS_ADMIN` before loading XDP, matching production
-verifier restrictions; injected frames additionally require `CAP_NET_RAW`.
+distinction for memset, memcpy, memmove, memcmp, and bcmp.
+
+The next rejection, `R4 has pointer with unsupported alu operation`, occurred at
+`r4 += r5` with a packet pointer and a known scalar offset of 14. Linux 6.1's
+speculation sanitization supports stack/map pointers at that point, but rejects
+packet pointers when `bpf_bypass_spec_v1()` is false. That predicate uses
+`perfmon_capable()` (`CAP_PERFMON` or `CAP_SYS_ADMIN`), rather than `CAP_BPF` or
+UID 0. This exposed an incomplete deployment capability list. Production Compose
+and the isolated kernel harness now include `CAP_PERFMON` alongside `CAP_BPF`
+and `CAP_NET_ADMIN`, while still dropping `CAP_SYS_ADMIN`. The test packet injector
+additionally requires `CAP_NET_RAW`. Startup diagnostics name all three capture
+capabilities.
+
+The capability requirement was checked against the Linux 6.1
+[verifier](https://github.com/torvalds/linux/blob/v6.1/kernel/bpf/verifier.c#L7440-L7473),
+[BPF capability predicates](https://github.com/torvalds/linux/blob/v6.1/include/linux/bpf.h#L1676-L1698),
+and [capability definitions](https://github.com/torvalds/linux/blob/v6.1/include/uapi/linux/capability.h#L366-L378).
 Runtime acceptance with these changes remains unverified locally.
 
 The isolated privileged harness and CI workflow are provided for these checks.
