@@ -640,9 +640,23 @@ mod kernel_tests {
         k.reconcile(&[], &[], false, einblick_core::unix_now())?;
         k.attach(&c)?;
         let old = k.poll()?.totals;
-        send(&frame(false, false, false))?;
+        let packet = frame(false, false, false);
+        send(&packet)?;
         let obs = k.poll()?;
         ensure!(obs.totals.passed > old.passed, "IPv4 pass");
+        ensure!(
+            obs.totals.bytes >= old.bytes + packet.len() as u64,
+            "global byte counter includes the complete Ethernet frame"
+        );
+        let source = obs
+            .sources
+            .iter()
+            .find(|source| source.ip == "192.0.2.1".parse::<IpAddr>().unwrap())
+            .context("missing IPv4 source counters")?;
+        ensure!(
+            source.packets == 1 && source.bytes == packet.len() as u64,
+            "source byte counter uses the kernel's scalar packet length"
+        );
         ensure!(
             obs.syns
                 .iter()

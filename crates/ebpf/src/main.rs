@@ -1,16 +1,17 @@
 #![no_std]
 #![no_main]
-use aya_ebpf::{bindings::xdp_action,helpers::bpf_ktime_get_ns,macros::{map,xdp},maps::{Array,HashMap,PerCpuArray,PerCpuHashMap,RingBuf,lpm_trie::{LpmTrie,Key}},programs::XdpContext};
+use aya_ebpf::{bindings::xdp_action,helpers::{bpf_ktime_get_ns,bpf_xdp_get_buff_len},macros::{map,xdp},maps::{Array,HashMap,PerCpuArray,PerCpuHashMap,RingBuf,lpm_trie::{LpmTrie,Key}},programs::XdpContext};
 use einblick_common::*;
 
 struct XdpPacket {
     start: usize,
     end: usize,
+    length: usize,
 }
 impl PacketRead for XdpPacket {
     #[inline(always)]
     fn packet_len(&self) -> usize {
-        self.end - self.start
+        self.length
     }
     #[inline(always)]
     fn read_byte(&self, at: usize) -> Option<u8> {
@@ -63,9 +64,11 @@ impl PacketRead for XdpPacket {
 }
 #[xdp]
 pub fn ingress(ctx:XdpContext)->u32 {
-    let len=ctx.data_end()-ctx.data();
+    // Helper 188 returns a scalar length. Subtracting the verifier's packet
+    // pointers requires permission to leak pointers and fails with our caps.
+    let len=unsafe {bpf_xdp_get_buff_len(ctx.ctx)} as usize;
     count(TOTAL,1);count(BYTES,len as u64);
-    let data=XdpPacket{start:ctx.data(),end:ctx.data_end()};
+    let data=XdpPacket{start:ctx.data(),end:ctx.data_end(),length:len};
     let packet=parse_reader(&data);let now=unsafe {bpf_ktime_get_ns()};
     if packet.limited {count(PARSE_LIMIT,1);}
     if packet.has_address {

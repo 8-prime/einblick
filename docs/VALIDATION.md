@@ -56,6 +56,16 @@ confirmed direct packet-pointer bounds checks before packet loads. Workspace
 tests, including malformed IPv6 extension lengths and every truncation of that
 fixture, and Clippy passed after the changes.
 
+The next verifier rejection, `R8 pointer -= pointer prohibited`, came from
+calculating packet length as `data_end - data`. XDP now calls
+`bpf_xdp_get_buff_len` (helper 188) once and reuses its scalar result for parsing
+and byte counters. Packet loads retain their direct `data_end` bounds checks.
+The embedding check requires this helper call; the object containing pointer
+subtraction was rejected, while the rebuilt object passed. Disassembly confirmed
+that the packet-length calculation now calls helper 188. The privileged harness
+also checks global and per-source byte counts for an injected Ethernet frame;
+these runtime assertions remain unverified locally.
+
 The earlier successful Docker image build predates this correction. Corrected
 runtime verifier acceptance and enforcement still require the privileged target
 host. A static ELF check and compilation are not substitutes for that validation.

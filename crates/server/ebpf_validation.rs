@@ -48,6 +48,20 @@ pub fn validate(bytes: &[u8]) -> Result<(), String> {
         }
         if name == "ingress" {
             ingress = section.name().map_err(|e| e.to_string())? == "xdp";
+            // Length must come from helper 188 as a scalar, rather than
+            // subtracting data/data_end pointers under the restricted caps.
+            let scalar_length = body.chunks_exact(8).any(|insn| {
+                let immediate: [u8; 4] = insn[4..8].try_into().unwrap();
+                let helper = if file.is_little_endian() {
+                    i32::from_le_bytes(immediate)
+                } else {
+                    i32::from_be_bytes(immediate)
+                };
+                insn[0] == 0x85 && insn[1] == 0 && helper == 188
+            });
+            if !scalar_length {
+                return Err("ingress must obtain a scalar length from bpf_xdp_get_buff_len".into());
+            }
         }
     }
     if !ingress {
