@@ -4,6 +4,7 @@
 /frontend/dist/
 /data/
 /secrets/
+/einblick.toml
 *.sqlite*
 
 __pycache__/

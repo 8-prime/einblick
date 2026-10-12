@@ -46,6 +46,17 @@ binds the web service to `127.0.0.1:9080`. This is separate from capture: XDP se
 all ingress on selected interfaces, including forwarded/container traffic before
 host firewall/NAT handling.
 
+For this rootful production stack, make the password file readable by UID 0:
+
+```sh
+sudo chown root:root secrets/admin-password
+```
+
+The container drops filesystem permission overrides, so ownership matters even
+though it runs as root. A bind-mounted data directory, if used instead of the
+named volume, must also be writable by UID 0. Rootless mock previews use the
+invoking user's ownership instead.
+
 ```sh
 docker compose up --build -d
 docker compose logs -f einblick

@@ -2,7 +2,7 @@
 
 ## Passed locally
 
-- Rust workspace: **17 tests passed**, one privileged kernel test explicitly ignored.
+- Rust workspace: **18 tests passed**, one privileged kernel test explicitly ignored.
 - Targeted API regression: authentication, Origin/CSRF checks, logout, and asset-path
   traversal rejection passed.
 - `cargo fmt --all -- --check` and Clippy with warnings denied passed.
@@ -10,7 +10,7 @@
 - Kernel object: compiled successfully for `bpfel-unknown-none` using nightly Rust
   1.101.0 (2026-10-12) and the official bpf-linker v0.11.1 binary.
 - Userspace release binary: built with embedded eBPF and frontend assets,
-  approximately **6.8 MiB**. The kernel ELF object is approximately **8.7 KiB**.
+  approximately **6.8 MiB**. The corrected kernel ELF object is approximately **8.9 KiB**.
 - Both debug and release mock HTTP smoke tests passed: login, static dashboard,
   IPv6 manual block, mode persistence, graceful shutdown
   with an SSE client, restart restoration, stored history, audit events, and
@@ -33,23 +33,32 @@ without double-counting hourly totals.
 ## Not verified locally
 
 Runtime XDP verifier acceptance, real packet pass/drop behavior, and owned-link
-crash cleanup could not be executed: root access via sudo requires a password.
-The system Docker daemon is stopped and starting it requires sudo authentication.
-The image and mock container were verified using a temporary rootless daemon;
-the privileged production Compose deployment remains unverified. Successful
-compilation does not establish verifier acceptance or runtime attachment support.
+crash cleanup require privileged kernel tests and remain unverified locally.
+The image and mock container were verified using rootless Docker; this does not
+establish verifier acceptance or runtime attachment support.
 
-The running preview's Docker socket is
-`unix:///tmp/einblick-docker-runtime/docker.sock`. To manage it in this session:
+## XDP verifier regression correction
 
-```sh
-export DOCKER_HOST=unix:///tmp/einblick-docker-runtime/docker.sock
-docker compose -f docker-compose.demo.yml ps
-docker compose -f docker-compose.demo.yml down
-```
+Inspection of the original ELF confirmed that its `ingress` function ended with
+a relocated call to `panic_bounds_check`, causing the verifier's
+`last insn is not an exit or jmp` structural rejection.
 
-The daemon and its image/data storage are under `/tmp`; this local preview is not
-installed as a service and should not be expected to survive a reboot.
+Packet reads now return incomplete observations on missing bytes, without Rust
+indexing panic paths. The XDP reader also compares each read pointer directly
+with `data_end`, with bounded offsets, rather than relying on slice-length
+comparisons to prove packet access to the verifier. The parsing rules remain
+shared with the userspace slice reader.
+
+The server's build script validates embedded ELF functions for panic symbols and
+valid final EXIT/JMP instructions. An embedding build using the original object
+was rejected by that check, and the corrected object passed it. Disassembly
+confirmed direct packet-pointer bounds checks before packet loads. Workspace
+tests, including malformed IPv6 extension lengths and every truncation of that
+fixture, and Clippy passed after the changes.
+
+The earlier successful Docker image build predates this correction. Corrected
+runtime verifier acceptance and enforcement still require the privileged target
+host. A static ELF check and compilation are not substitutes for that validation.
 
 The isolated privileged harness and CI workflow are provided for these checks.
 Prepare binaries as a normal user, then run:

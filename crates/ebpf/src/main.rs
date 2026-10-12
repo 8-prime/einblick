@@ -3,6 +3,31 @@
 use aya_ebpf::{bindings::xdp_action,helpers::bpf_ktime_get_ns,macros::{map,xdp},maps::{Array,HashMap,PerCpuArray,PerCpuHashMap,RingBuf,lpm_trie::{LpmTrie,Key}},programs::XdpContext};
 use einblick_common::*;
 
+struct XdpPacket {
+    start: usize,
+    end: usize,
+}
+impl PacketRead for XdpPacket {
+    #[inline(always)]
+    fn packet_len(&self) -> usize {
+        self.end - self.start
+    }
+    #[inline(always)]
+    fn read_byte(&self, at: usize) -> Option<u8> {
+        // The bounded parser reads at most four 2048-byte IPv6 extension headers.
+        // Explicitly bound variable offsets for the verifier before pointer math.
+        if at > 16384 {
+            return None;
+        }
+        let pointer = self.start + at;
+        if pointer + 1 > self.end {
+            return None;
+        }
+        // Only read after comparing the packet pointer directly with data_end.
+        Some(unsafe { (pointer as *const u8).read() })
+    }
+}
+
 #[map] static METRICS:PerCpuArray<u64>=PerCpuArray::with_max_entries(METRICS_LEN,0);
 #[map] static SOURCES:PerCpuHashMap<Address,SourceCounters>=PerCpuHashMap::with_max_entries(4096,1);
 #[map] static PORTS:PerCpuHashMap<u32,u64>=PerCpuHashMap::with_max_entries(4096,0);
@@ -40,8 +65,8 @@ use einblick_common::*;
 pub fn ingress(ctx:XdpContext)->u32 {
     let len=ctx.data_end()-ctx.data();
     count(TOTAL,1);count(BYTES,len as u64);
-    let data=unsafe {core::slice::from_raw_parts(ctx.data() as *const u8,len)};
-    let packet=parse(data);let now=unsafe {bpf_ktime_get_ns()};
+    let data=XdpPacket{start:ctx.data(),end:ctx.data_end()};
+    let packet=parse_reader(&data);let now=unsafe {bpf_ktime_get_ns()};
     if packet.limited {count(PARSE_LIMIT,1);}
     if packet.has_address {
         if SOURCES.get_ptr_mut(&packet.source).is_none() {

@@ -1,11 +1,15 @@
 use std::{env, fs, path::PathBuf};
+mod ebpf_validation;
 fn main() {
+    println!("cargo:rerun-if-changed=ebpf_validation.rs");
     println!("cargo:rerun-if-env-changed=EINBLICK_EBPF_OBJECT");
     println!("cargo:rerun-if-changed=../../frontend/dist");
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let bytes = if let Some(path) = env::var_os("EINBLICK_EBPF_OBJECT") {
         println!("cargo:rerun-if-changed={}", PathBuf::from(&path).display());
-        fs::read(path).expect("read EINBLICK_EBPF_OBJECT")
+        let bytes = fs::read(path).expect("read EINBLICK_EBPF_OBJECT");
+        ebpf_validation::validate(&bytes).expect("validate embedded eBPF object");
+        bytes
     } else {
         Vec::new()
     };

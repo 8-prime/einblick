@@ -64,19 +64,55 @@ pub struct Packet {
     pub has_address: bool,
 }
 
+/// Packet reads may use slice bounds in userspace or explicit packet-pointer
+/// bounds in XDP. The latter must remain visible to the kernel verifier.
+pub trait PacketRead {
+    fn packet_len(&self) -> usize;
+    fn read_byte(&self, at: usize) -> Option<u8>;
+}
+impl PacketRead for [u8] {
+    #[inline(always)]
+    fn packet_len(&self) -> usize {
+        self.len()
+    }
+    #[inline(always)]
+    fn read_byte(&self, at: usize) -> Option<u8> {
+        self.get(at).copied()
+    }
+}
+
 #[inline(always)]
-fn word(data: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_be_bytes([*data.get(at)?, *data.get(at + 1)?]))
+fn word<R: PacketRead + ?Sized>(data: &R, at: usize) -> Option<u16> {
+    Some(u16::from_be_bytes([
+        data.read_byte(at)?,
+        data.read_byte(at + 1)?,
+    ]))
 }
 
 /// Parse only bounded L2/L3/L4 headers. Preserve an extractable source even
 /// when fragments or extension headers prevent transport parsing.
 #[inline(always)]
 pub fn parse(data: &[u8]) -> Packet {
+    parse_reader(data)
+}
+
+#[inline(always)]
+pub fn parse_reader<R: PacketRead + ?Sized>(data: &R) -> Packet {
     let mut p = Packet {
         limited: true,
         ..Packet::default()
     };
+    // Indexing a packet slice can leave panic_bounds_check calls in the BPF
+    // object even after a preceding length check. Make every read fallible so
+    // malformed headers return incomplete evidence without a panic path.
+    macro_rules! byte {
+        ($offset:expr) => {
+            match data.read_byte($offset) {
+                Some(value) => value,
+                None => return p,
+            }
+        };
+    }
     let Some(mut ether) = word(data, 12) else {
         return p;
     };
@@ -92,18 +128,18 @@ pub fn parse(data: &[u8]) -> Packet {
     }
     let end;
     if ether == 0x0800 {
-        if data.len() < at + 20 || data[at] >> 4 != 4 {
+        if data.packet_len() < at + 20 || byte!(at) >> 4 != 4 {
             return p;
         }
         p.source.family = 4;
         for i in 0..4 {
-            p.source.bytes[i] = data[at + 12 + i];
+            p.source.bytes[i] = byte!(at + 12 + i);
         }
         p.has_address = true;
-        p.protocol = data[at + 9];
-        let ihl = (data[at] as usize & 15) * 4;
+        p.protocol = byte!(at + 9);
+        let ihl = (byte!(at) as usize & 15) * 4;
         let size = word(data, at + 2).unwrap_or(0) as usize;
-        if ihl < 20 || size < ihl || data.len() < at + size {
+        if ihl < 20 || size < ihl || data.packet_len() < at + size {
             return p;
         }
         end = at + size;
@@ -113,17 +149,17 @@ pub fn parse(data: &[u8]) -> Packet {
         }
         at += ihl;
     } else if ether == 0x86dd {
-        if data.len() < at + 40 || data[at] >> 4 != 6 {
+        if data.packet_len() < at + 40 || byte!(at) >> 4 != 6 {
             return p;
         }
         p.source.family = 6;
         for i in 0..16 {
-            p.source.bytes[i] = data[at + 8 + i];
+            p.source.bytes[i] = byte!(at + 8 + i);
         }
         p.has_address = true;
-        p.protocol = data[at + 6];
+        p.protocol = byte!(at + 6);
         let size = word(data, at + 4).unwrap_or(0) as usize;
-        if size == 0 || data.len() < at + 40 + size {
+        if size == 0 || data.packet_len() < at + 40 + size {
             return p;
         }
         end = at + 40 + size;
@@ -136,11 +172,11 @@ pub fn parse(data: &[u8]) -> Packet {
                 if at + 2 > end {
                     return p;
                 }
-                let next = data[at];
+                let next = byte!(at);
                 let size = if p.protocol == 51 {
-                    (data[at + 1] as usize + 2) * 4
+                    (byte!(at + 1) as usize + 2) * 4
                 } else {
-                    (data[at + 1] as usize + 1) * 8
+                    (byte!(at + 1) as usize + 1) * 8
                 };
                 if at + size > end {
                     return p;
@@ -159,12 +195,12 @@ pub fn parse(data: &[u8]) -> Packet {
         if at + 20 > end {
             return p;
         }
-        let size = (data[at + 12] >> 4) as usize * 4;
+        let size = (byte!(at + 12) >> 4) as usize * 4;
         if size < 20 || at + size > end {
             return p;
         }
         p.port = word(data, at + 2).unwrap_or(0);
-        p.syn = data[at + 13] & 0x12 == 0x02;
+        p.syn = byte!(at + 13) & 0x12 == 0x02;
     } else if p.protocol == 17 {
         if at + 8 > end {
             return p;
@@ -240,5 +276,26 @@ mod tests {
         assert_eq!(parse(&b).source.family, 6);
         b[20] = 44;
         assert!(parse(&b).limited && parse(&b).has_address);
+    }
+    #[test]
+    fn malformed_ipv6_extension_lengths_and_truncation() {
+        let mut b = std::vec![0; 82];
+        b[12..14].copy_from_slice(&0x86ddu16.to_be_bytes());
+        b[14] = 0x60;
+        b[18..20].copy_from_slice(&28u16.to_be_bytes());
+        b[20] = 0;
+        b[54] = 6;
+        b[74] = 0x50;
+        b[75] = 2;
+        assert!(parse(&b).syn);
+        for n in 0..b.len() {
+            let p = parse(&b[..n]);
+            assert!(p.limited && !p.syn, "truncated at {n}");
+        }
+        for length in 1..=255 {
+            b[55] = length;
+            let p = parse(&b);
+            assert!(p.has_address && p.limited && !p.syn);
+        }
     }
 }

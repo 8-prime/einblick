@@ -302,6 +302,7 @@ dependencies = [
  "ipnet",
  "libc",
  "mime_guess",
+ "object",
  "rand",
  "rust-embed",
  "serde",
