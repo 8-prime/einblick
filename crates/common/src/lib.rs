@@ -9,6 +9,32 @@ pub struct Address {
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+pub struct AssociationKey {
+    pub source: Address,
+    pub destination: Address,
+    pub interface: u32,
+    pub protocol: u32,
+    pub port: u32,
+    pub parsed: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct AssociationCounters {
+    pub packets: u64,
+    pub bytes: u64,
+    pub passed: u64,
+    pub dropped: u64,
+    pub syns: u64,
+    pub syn_acks: u64,
+    pub resets: u64,
+    pub first_seen: u64,
+    pub last_seen: u64,
+    pub source_ports: [u16; 8],
+    pub source_port_count: u32,
+    pub source_ports_truncated: u32,
+}
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct SourceCounters {
     pub packets: u64,
     pub bytes: u64,
@@ -40,6 +66,8 @@ pub struct Limiter {
 mod pod {
     use super::*;
     unsafe impl aya::Pod for Address {}
+    unsafe impl aya::Pod for AssociationKey {}
+    unsafe impl aya::Pod for AssociationCounters {}
     unsafe impl aya::Pod for SourceCounters {}
     unsafe impl aya::Pod for SynEvent {}
     unsafe impl aya::Pod for Deadline {}
@@ -52,13 +80,20 @@ pub const DROPPED: u32 = 3;
 pub const PARSE_LIMIT: u32 = 4;
 pub const EVENT_LOSS: u32 = 5;
 pub const MAP_FULL: u32 = 6;
-pub const METRICS_LEN: u32 = 7;
+pub const SOURCE_MISS: u32 = 7;
+pub const PORT_MISS: u32 = 8;
+pub const ASSOCIATION_MISS: u32 = 9;
+pub const METRICS_LEN: u32 = 10;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Packet {
     pub source: Address,
+    pub destination: Address,
     pub protocol: u8,
     pub port: u16,
+    pub source_port: u16,
+    pub tcp_flags: u8,
+    pub transport_parsed: bool,
     pub syn: bool,
     pub limited: bool,
     pub has_address: bool,
@@ -132,8 +167,10 @@ pub fn parse_reader<R: PacketRead + ?Sized>(data: &R) -> Packet {
             return p;
         }
         p.source.family = 4;
+        p.destination.family = 4;
         for i in 0..4 {
             p.source.bytes[i] = byte!(at + 12 + i);
+            p.destination.bytes[i] = byte!(at + 16 + i);
         }
         p.has_address = true;
         p.protocol = byte!(at + 9);
@@ -153,8 +190,10 @@ pub fn parse_reader<R: PacketRead + ?Sized>(data: &R) -> Packet {
             return p;
         }
         p.source.family = 6;
+        p.destination.family = 6;
         for i in 0..16 {
             p.source.bytes[i] = byte!(at + 8 + i);
+            p.destination.bytes[i] = byte!(at + 24 + i);
         }
         p.has_address = true;
         p.protocol = byte!(at + 6);
@@ -200,7 +239,10 @@ pub fn parse_reader<R: PacketRead + ?Sized>(data: &R) -> Packet {
             return p;
         }
         p.port = word(data, at + 2).unwrap_or(0);
-        p.syn = byte!(at + 13) & 0x12 == 0x02;
+        p.source_port = word(data, at).unwrap_or(0);
+        p.tcp_flags = byte!(at + 13);
+        p.syn = p.tcp_flags & 0x12 == 0x02;
+        p.transport_parsed = true;
     } else if p.protocol == 17 {
         if at + 8 > end {
             return p;
@@ -210,6 +252,8 @@ pub fn parse_reader<R: PacketRead + ?Sized>(data: &R) -> Packet {
             return p;
         }
         p.port = word(data, at + 2).unwrap_or(0);
+        p.source_port = word(data, at).unwrap_or(0);
+        p.transport_parsed = true;
     }
     p.limited = false;
     p
@@ -241,6 +285,36 @@ mod tests {
         assert_eq!(&p.source.bytes[..4], &[192, 0, 2, 1]);
         b[47] = 0x12;
         assert!(!parse(&b).syn);
+    }
+    #[test]
+    fn association_addresses_ports_and_tcp_flags() {
+        let mut b = ipv4();
+        b[30..34].copy_from_slice(&[192, 0, 2, 44]);
+        b[34..36].copy_from_slice(&52000u16.to_be_bytes());
+        let p = parse(&b);
+        assert_eq!(&p.destination.bytes[..4], &[192, 0, 2, 44]);
+        assert_eq!(p.source_port, 52000);
+        assert!(p.transport_parsed && p.syn);
+        b[47] = 0x14;
+        assert_eq!(parse(&b).tcp_flags, 0x14);
+        b[20] = 0x20;
+        let fragment = parse(&b);
+        assert!(!fragment.transport_parsed);
+        assert_eq!(fragment.destination.family, 4);
+    }
+    #[test]
+    fn udp_zero_port_is_distinct_from_unparsed_transport() {
+        let mut b = ipv4();
+        b[23] = 17;
+        b[34..36].copy_from_slice(&53u16.to_be_bytes());
+        b[36..38].copy_from_slice(&0u16.to_be_bytes());
+        b[38..40].copy_from_slice(&20u16.to_be_bytes());
+        let p = parse(&b);
+        assert!(p.transport_parsed && !p.syn);
+        assert_eq!(p.source_port, 53);
+        assert_eq!(p.port, 0);
+        b[38..40].copy_from_slice(&100u16.to_be_bytes());
+        assert!(!parse(&b).transport_parsed);
     }
     #[test]
     fn truncation_and_fragment_preserve_source() {

@@ -10,6 +10,12 @@ database = "/data/einblick.sqlite"
 password_file = "/run/secrets/admin-password"
 source_capacity = 4096
 port_capacity = 4096
+# Per-bank association slots; both port and association banks rotate each poll.
+association_capacity = 4096
+# Distinct associations per minute, including low-volume sources.
+detail_minute_capacity = 16384
+# Combined minute/hour detail rows; oldest buckets expire at this bound.
+detail_row_limit = 1000000
 ring_bytes = 1048576
 # Protect your actual administrator / VPN address before enabling automatic bans.
 management_allowlist = []

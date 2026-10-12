@@ -16,6 +16,7 @@ type Job = Box<dyn FnOnce(&mut Connection) + Send>;
 #[derive(Clone)]
 pub struct Database {
     tx: SyncSender<Job>,
+    read_tx: SyncSender<Job>,
     pub healthy: Arc<AtomicBool>,
 }
 impl Database {
@@ -34,7 +35,7 @@ impl Database {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!(
-            version <= 1,
+            version <= 2,
             "database schema is newer than this application"
         );
         if version == 0 {
@@ -47,6 +48,32 @@ impl Database {
                 PRAGMA user_version=1;")?;
             t.commit()?;
         }
+        if version < 2 {
+            if version == 1 && path != ":memory:" {
+                let backup_path = format!("{path}.schema-v1-backup");
+                ensure!(
+                    !Path::new(&backup_path).exists(),
+                    "migration backup already exists: {backup_path}; preserve it and choose a new database path before retrying"
+                );
+                conn.backup(rusqlite::MAIN_DB, &backup_path, None)?;
+            }
+            let t = conn.transaction()?;
+            t.execute_batch(include_str!("traffic_schema.sql"))?;
+            t.commit()?;
+        }
+        let (read_tx, read_rx) = sync_channel::<Job>(16);
+        if path != ":memory:" {
+            let mut reader =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            reader.busy_timeout(std::time::Duration::from_secs(2))?;
+            std::thread::Builder::new()
+                .name("sqlite-reader".into())
+                .spawn(move || {
+                    while let Ok(job) = read_rx.recv() {
+                        job(&mut reader);
+                    }
+                })?;
+        }
         let (tx, rx) = sync_channel::<Job>(64);
         std::thread::Builder::new()
             .name("sqlite-writer".into())
@@ -56,9 +83,26 @@ impl Database {
                 }
             })?;
         Ok(Self {
+            read_tx: if path == ":memory:" {
+                tx.clone()
+            } else {
+                read_tx
+            },
             tx,
             healthy: Arc::new(AtomicBool::new(true)),
         })
+    }
+    pub async fn read<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
+        let (tx, rx) = oneshot::channel();
+        self.read_tx
+            .try_send(Box::new(move |c| {
+                let _ = tx.send(f(c));
+            }))
+            .map_err(|_| anyhow!("history read queue full or unavailable"))?;
+        rx.await.context("history reader stopped")?
     }
     pub async fn call<T: Send + 'static>(
         &self,
@@ -146,7 +190,7 @@ impl Database {
         .await
     }
     pub async fn events(&self, limit: u32, before: i64) -> Result<Vec<Event>> {
-        self.call(move |c| {
+        self.read(move |c| {
             let mut s = c.prepare(
                 "SELECT id,at,kind,detail FROM events WHERE id<? ORDER BY id DESC LIMIT ?",
             )?;
@@ -224,7 +268,7 @@ impl Database {
     }).await
     }
     pub async fn history(&self, resolution: String, from: i64, to: i64) -> Result<Vec<Aggregate>> {
-        self.call(move|c| {
+        self.read(move|c| {
         ensure!(resolution=="minute"||resolution=="hour","resolution must be minute or hour");
         let mut s=c.prepare("SELECT data FROM aggregates WHERE resolution=? AND at>=? AND at<=? ORDER BY at DESC LIMIT 1000")?;
         let values=s.query_map(params![resolution,from,to],|r|r.get::<_,String>(0))?;
@@ -293,6 +337,41 @@ mod tests {
         .unwrap();
         assert!(db.event(1, "test", Value::Null).await.is_err());
         assert!(!db.healthy.load(Ordering::Acquire));
+    }
+    #[tokio::test]
+    async fn version_one_migration_preserves_data_and_creates_recoverable_backup() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "einblick-migration-{}-{stamp}.sqlite",
+            std::process::id()
+        ));
+        let name = path.to_str().unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);INSERT INTO settings VALUES('automatic','true');INSERT INTO settings VALUES('blocking','true');
+            CREATE TABLE events(id INTEGER PRIMARY KEY,at INTEGER NOT NULL,kind TEXT NOT NULL,detail TEXT NOT NULL);INSERT INTO events VALUES(1,120,'test','{}');
+            CREATE TABLE aggregates(resolution TEXT,at INTEGER,data TEXT,PRIMARY KEY(resolution,at));
+            CREATE TABLE rules(id INTEGER PRIMARY KEY,network TEXT,kind TEXT,actor TEXT,reason TEXT,created INTEGER,expires INTEGER,enabled INTEGER,applied INTEGER,error TEXT);
+            INSERT INTO rules VALUES(1,'192.0.2.1/32','allow','admin','protected',120,NULL,1,1,NULL);PRAGMA user_version=1;").unwrap();
+        drop(conn);
+        let db = Database::open(name).unwrap();
+        assert_eq!(db.settings().await.unwrap(), (true, true));
+        assert_eq!(db.rules().await.unwrap().len(), 1);
+        assert_eq!(db.events(100, i64::MAX).await.unwrap().len(), 1);
+        let backup = Connection::open(format!("{name}.schema-v1-backup")).unwrap();
+        assert_eq!(
+            backup
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        drop(backup);
+        drop(db);
+        for suffix in ["", "-wal", "-shm", ".schema-v1-backup"] {
+            let _ = std::fs::remove_file(format!("{name}{suffix}"));
+        }
     }
 }
 

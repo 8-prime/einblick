@@ -31,6 +31,8 @@ PYTHON
 # arithmetic, without SYS_ADMIN. NET_RAW is only for injected test frames.
 setpriv --bounding-set=-all,+bpf,+net_admin,+perfmon,+net_raw -- \
   "$test_binary" --exact backend::kernel_tests::xdp_namespace_rules_and_counters --ignored --nocapture
+EINBLICK_TEST_GENERIC=1 setpriv --bounding-set=-all,+bpf,+net_admin,+perfmon,+net_raw -- \
+  "$test_binary" --exact backend::kernel_tests::xdp_namespace_rules_and_counters --ignored --nocapture
 # Verify crash cleanup with a real server process and an unpinned XDP link.
 dir=$(mktemp -d)
 trap 'if [[ -n ${pid:-} ]]; then kill "$pid" 2>/dev/null || true; fi; rm -rf "$dir"' EXIT
@@ -43,6 +45,7 @@ database = "$dir/test.sqlite"
 password_file = "$dir/password"
 source_capacity = 128
 port_capacity = 128
+association_capacity = 128
 CONFIG
 setpriv --bounding-set=-all,+bpf,+net_admin,+perfmon -- \
   ./target/release/einblick --config "$dir/config.toml" > "$dir/server.log" 2>&1 &

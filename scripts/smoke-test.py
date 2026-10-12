@@ -43,6 +43,7 @@ management_allowlist = ["192.0.2.24/32"]
         proc=subprocess.Popen([str(BINARY),'--config',str(config)],cwd=ROOT,stdout=subprocess.DEVNULL)
         wait();assert request('/')[0]==200
         assert request('/api/v1/snapshot')[0]==401
+        assert request('/api/v1/sources/192.0.2.24/traffic')[0]==401
         cookie,csrf=login()
         def api(path,method='GET',data=None):
             status,_,body=request('/api/v1'+path,method,data,cookie,csrf)
@@ -55,6 +56,15 @@ management_allowlist = ["192.0.2.24/32"]
         snapshot=api('/snapshot');assert snapshot['blocking'] and snapshot['totals']['dropped']>0,snapshot
         assert any(r['applied'] for r in snapshot['rules']),snapshot['rules']
         api('/mode','POST',{'automatic':True,'blocking':True,'acknowledged':True})
+        assert api('/snapshot')['health']['telemetry_complete'], 'control command fabricated incomplete telemetry'
+        detail=api('/sources/192.0.2.24/traffic?protocol=6&port=443')
+        assert len(detail['rows'])==1 and detail['rows'][0]['port']==443,detail
+        assert detail['rows'][0]['passed']>0 and detail['rows'][0]['syns']>0,detail
+        previous_detail=detail['rows'][0]['packets']
+        ipv6=api('/sources/2001:db8::12/traffic')
+        assert ipv6['rows'] and ipv6['rows'][0]['dropped']>0,ipv6
+        assert request('/api/v1/sources/not-an-ip/traffic',cookie=cookie)[0]==400
+        assert request('/api/v1/sources/192.0.2.24/traffic?limit=501',cookie=cookie)[0]==400
         # Hold a live SSE connection during shutdown to check graceful completion.
         live=http.client.HTTPConnection('127.0.0.1',19081,timeout=5)
         live.request('GET','/api/v1/stream',headers={'Cookie':cookie});response=live.getresponse()
@@ -65,6 +75,8 @@ management_allowlist = ["192.0.2.24/32"]
         wait();cookie,csrf=login();snapshot=api('/snapshot')
         assert snapshot['automatic'] and snapshot['blocking'] and any(r['applied'] for r in snapshot['rules'])
         history=api('/history?from=0');assert history and sum(h['totals']['packets'] for h in history)>0
+        restored=api('/sources/192.0.2.24/traffic?port=443')
+        assert restored['rows'][0]['packets']>=previous_detail,restored
         assert any(e['kind']=='rule_created' for e in api('/events'))
         api('/emergency-disable','POST');time.sleep(1);assert not api('/snapshot')['blocking']
         proc.send_signal(signal.SIGTERM);proc.wait(timeout=8);assert proc.returncode==0

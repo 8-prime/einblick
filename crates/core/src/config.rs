@@ -20,6 +20,9 @@ pub struct Config {
     pub secure_cookies: bool,
     pub source_capacity: u32,
     pub port_capacity: u32,
+    pub association_capacity: u32,
+    pub detail_minute_capacity: usize,
+    pub detail_row_limit: usize,
     pub ring_bytes: u32,
     pub management_allowlist: Vec<IpNet>,
     pub detection: Thresholds,
@@ -77,6 +80,9 @@ impl Default for Config {
             secure_cookies: true,
             source_capacity: 4096,
             port_capacity: 4096,
+            association_capacity: 4096,
+            detail_minute_capacity: 16384,
+            detail_row_limit: 1_000_000,
             ring_bytes: 1 << 20,
             management_allowlist: vec![],
             detection: Thresholds::default(),
@@ -135,6 +141,12 @@ impl Config {
             (128..=32768).contains(&self.source_capacity)
                 && (128..=8192).contains(&self.port_capacity),
             "map capacities out of range"
+        );
+        ensure!(
+            (128..=16384).contains(&self.association_capacity)
+                && (128..=65536).contains(&self.detail_minute_capacity)
+                && (128..=10_000_000).contains(&self.detail_row_limit),
+            "detail capacities out of range"
         );
         ensure!(
             self.ring_bytes.is_power_of_two()

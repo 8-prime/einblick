@@ -1,5 +1,73 @@
 # Implementation validation — 2026-10-12
 
+## Port-bank reclamation and source traffic detail
+
+Current implementation checks (supersede the earlier verifier notes below):
+
+- Rust workspace: **34 passed**, with the privileged kernel test and manual
+  resource measurement excluded from the ordinary suite. Both were run separately.
+  Format and strict Clippy checks passed.
+- Svelte: zero errors/warnings; production build passed. Browser checks confirmed
+  selectable IPv4/IPv6 sources, destination-port filtering, coverage messages,
+  and the detail table. Screenshot: `target/ui-preview/source-detail.png`.
+- Debug and release HTTP smoke tests passed, including authenticated source-detail
+  access, IPv6 drops, malformed IP/limit rejection, health after control commands,
+  live detail, and detail surviving graceful restart.
+- eBPF compiled with nightly Rust **1.100.0 (2026-09-08)** and official
+  **bpf-linker v0.11.1**. Embedded ELF validation and release build passed. The
+  object is **15,656 bytes**; the release server is approximately **6.8 MiB**.
+- Isolated privileged WSL kernel **6.6.114.1-microsoft-standard-WSL2** accepted the
+  program and owned native/generic XDP links on veth. Both modes passed churn
+  through 256 ports across successive 128-slot intervals, deliberate within-bank
+  overflow and next-interval recovery, and exactly 1,000 concurrent port and
+  SYN/ACK-association counts during repeated bank switches.
+  UDP port zero, ICMP/no-port and fragment associations, RST indicators, bounded
+  source-port samples, and association pass/drop counts were checked as well.
+  Existing IPv4/IPv6,
+  VLAN/fragment enforcement, IPv6 extensions, allowlist, expiry, emergency disable,
+  attachment conflict, and SIGKILL detachment checks passed. Capabilities were
+  BPF/NET_ADMIN/PERFMON, with NET_RAW for injection and no SYS_ADMIN.
+- SQLite tests cover schema-v1 backup/data preservation, independent source
+  associations, nullable versus real port zero, pagination/filtering, idempotent
+  live/stored merging, hourly deltas, restart boundaries, pruning, and omitted
+  intervals within an existing bucket. Monitor tests prove that detail loss alone
+  does not suspend complete detectors, source loss still suspends bans, recreated
+  source counters use a new baseline, and writer backpressure carries gap metadata.
+
+The full-minute SQLite measurement used a file-backed database with **16,384
+distinct groups** (32,768 minute/hour rows) on WSL, in a debug test. One checkpoint
+took **2.252 s**; a 500-row query took **22.37 ms**, with **130,071 response bytes**.
+Allocated SQLite pages were **5,079,040 bytes**, with **5,154,152 WAL bytes** observed
+after commit (WAL auto-checkpointing can reuse this file). This is one synthetic
+batch, not a measurement of the million-row cap or sustained production latency.
+Run it with:
+
+```sh
+cargo test --locked -p einblick-core full_minute_resource_measurement -- --ignored --nocapture
+```
+
+Release mock smoke-test peak RSS was **27,344 KiB (26.7 MiB)**; debug was
+**34,064 KiB**. Those tests have three synthetic sources. The conservative kernel
+budget includes both association/port banks, per-CPU values and handshake maps;
+the default estimate is approximately **16.9 MiB at two possible CPUs** and
+**44.0 MiB at 16**. Actual allocation and maximum-capacity userspace memory were
+not measured. Large host CPU counts can require reducing capacities at startup.
+
+Docker Desktop's Linux engine was unreachable in this session, so the updated
+image was not rebuilt locally. pnpm checks used installed **10.7.0** with automatic
+package-manager switching disabled because the pinned **11.8.0** launcher was
+missing; the frozen lockfile was retained. CI still uses the pinned pnpm and
+nightly versions. No remote CI or homeserver deployment was performed.
+NIC-specific behavior, Linux 6.1 verification, sustained 100kpps throughput,
+two-vCPU performance and maximum-capacity memory/disk acceptance remain host
+validation tasks. The veth tests establish functional behavior on the tested
+kernel, not NIC throughput.
+
+## Earlier validation record
+
+The sections below record previous implementation stages; their statements about
+runtime verification being unavailable predate the WSL checks above.
+
 ## Passed locally
 
 - Rust workspace: **22 tests passed**, one privileged kernel test explicitly ignored.

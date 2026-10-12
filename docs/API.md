@@ -17,7 +17,8 @@ no bearer API tokens or multiple roles are included in this MVP.
 | POST | `/mode` | `{ "automatic":false, "blocking":true, "acknowledged":false }` |
 | POST | `/emergency-disable` | No body; disable kernel blocking before persistence |
 | GET | `/history` | `resolution=minute\|hour`, `from`, `to` Unix seconds; up to 1,000 newest buckets, ascending; 4 MiB data limit |
-| GET | `/events` | `limit` (default 100, max 200), `before` exclusive event ID cursor; newest first; 4 MiB data limit |
+| GET | `/events` | `limit` (default 100, max 200), `before` exclusive event ID cursor, optional exact source `ip`; newest first; 4 MiB data limit |
+| GET | `/sources/{ip}/traffic` | Source association detail; parameters and response below |
 
 Login requires an `Origin` matching `public_origin`. All other routes require the
 `einblick_session` cookie. Mutations also require `X-CSRF-Token` and matching Origin.
@@ -40,10 +41,57 @@ successfully disabling kernel blocking if restart settings could not be persiste
 
 `Snapshot`: `at`, cumulative `totals`, latest-interval `rate`, `sources`, `ports`,
 recent `detections`, `rules`, `automatic`, `blocking`, and `health`. `Totals` fields:
-`packets`, `bytes`, `passed`, `dropped`, `parse_limits`, `event_loss`, `map_full`.
+`packets`, `bytes`, `passed`, `dropped`, `parse_limits`, `event_loss`, `map_full`,
+`source_misses`, `port_misses`, `association_misses`. `map_full` remains the combined
+miss total. Detail miss rates follow the collected bank, while cumulative misses
+include the active bank too.
 Counters restart with the process. Source rows include `ip`, `packets`, `bytes`,
-`syns`; port rows include `protocol`, `port`, `packets`. Port zero means no parsed
+`syns`, `generation` (counter lifetime); port rows include `protocol`, `port`, `packets`. Port zero means no parsed
 transport destination. Rates are interval counts, not normalized bandwidth.
+The legacy port summary also conflates a real port zero; association detail below
+distinguishes it. The summary contains the top 100 cumulative collected ports.
+
+Health adds `detection_complete`, `detail_complete`, `reasons`, and `maps`
+(`name`, `used`, `capacity`). `telemetry_complete` combines the two scopes.
+Missing port/association detail alone does not suspend detectors with complete
+inputs. Storage/enforcement failures continue to suspend new automatic bans.
+Commands preserve the latest telemetry health. Session metadata also includes
+`detail_limits`: configured `minute_days`, `hourly_days`, and `row_limit`.
+
+## Source traffic detail
+
+`GET /api/v1/sources/{ip}/traffic` accepts canonicalizable IPv4/IPv6, including a
+URL-encoded IPv6 address. Authentication uses the same session cookie as snapshots.
+
+| Parameter | Meaning |
+|---|---|
+| `from`, `to` | Inclusive UTC Unix seconds; default last 24 hours; nonnegative range, at most 90 days |
+| `resolution` | `minute` (default) or `hour`; counts include entire overlapping buckets |
+| `protocol` | Optional IP protocol number, 0–255 |
+| `port` | Optional parsed destination port, 0–65535; zero is a real port zero |
+| `limit` | Default 100; 1–500 association rows per page |
+| `cursor` | URL-encoded opaque `next_cursor` from the previous page; retain the same filters/range |
+
+Rows group by destination address, interface, protocol and destination port,
+ordered stably by those fields. Each includes `source`, `destination`, `interface`,
+`protocol`, nullable `port`, `packets`, `bytes`, `passed`, `dropped`, `syns`
+(SYN without ACK), `syn_acks`, `resets`, `first_seen`, `last_seen`, `source_ports`
+(up to eight), and `source_ports_truncated`. Null ports mean no safely parsed
+TCP/UDP header. Source ports are a sample; historical merging can return a smaller
+sample with truncation flagged. No payload or connection-success claim is included.
+
+Response fields: `rows`, optional `next_cursor`, optional `capture_started`,
+optional `available_from`/`available_to` (persisted bucket bounds), `complete`,
+`omitted` (packet-detail omissions across the queried buckets), `stored_rows`
+(global retained row count), and `warnings`. Coverage is collector-wide, because
+an overflow can omit an association before its source is known in userspace.
+Absence of rows with incomplete coverage is not evidence of no attempts.
+
+Stored and live batches merge in one SQLite snapshot; committed batch identities
+prevent double counting. At most 500 bounded records remain below the 4 MiB
+response ceiling. Detail is separate from SSE snapshots; the selected dashboard
+view refreshes every five seconds and supports pagination and direct IP lookup.
+Partial buckets, gaps, expiry, caps, and pre-deployment history are disclosed.
 
 `Rule`: `id`, `network`, `kind`, `reason`, `actor`, `created`, optional `expires`,
 `enabled`, `applied`, optional `error`. Timestamps are UTC Unix seconds. Expired or

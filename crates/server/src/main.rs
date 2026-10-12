@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
         db,
         auth,
         snapshot,
+        live_traffic: monitor.live_traffic.clone(),
         commands,
         updates,
         shutdown: stop.clone(),

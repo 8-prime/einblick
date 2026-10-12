@@ -2,6 +2,7 @@
 /crates/ebpf/target/
 /frontend/node_modules/
 /frontend/dist/
+/frontend/.pnpm-store/
 /data/
 /secrets/
 /einblick.toml

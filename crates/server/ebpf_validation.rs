@@ -4,7 +4,12 @@ use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 // data through XdpPacket::read_byte. Require the latter's fixed-width guard.
 // This checks our emitted reader pattern, not general BPF pointer provenance.
 fn validate_packet_reads(body: &[u8], little_endian: bool) -> Result<(), String> {
-    let instructions: Vec<_> = body.chunks_exact(8).collect();
+    let instructions: Vec<&[u8]> = body
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|i| i.as_slice())
+        .collect();
     let dst = |i: &[u8]| if little_endian { i[1] & 15 } else { i[1] >> 4 };
     let src = |i: &[u8]| if little_endian { i[1] >> 4 } else { i[1] & 15 };
     let offset = |i: &[u8]| {
@@ -119,7 +124,7 @@ pub fn validate(bytes: &[u8]) -> Result<(), String> {
             ingress = section.name().map_err(|e| e.to_string())? == "xdp";
             // Length must come from helper 188 as a scalar, rather than
             // subtracting data/data_end pointers under the restricted caps.
-            let scalar_length = body.chunks_exact(8).any(|insn| {
+            let scalar_length = body.as_chunks::<8>().0.iter().any(|insn| {
                 let immediate: [u8; 4] = insn[4..8].try_into().unwrap();
                 let helper = if file.is_little_endian() {
                     i32::from_le_bytes(immediate)

@@ -122,13 +122,20 @@ headers, and malformed headers are counted as parsing limitations. Transport
 analysis is unavailable for these packets; safely extracted source addresses
 still participate in counters and enforcement. No payload is stored.
 
-Counter maps are separate from the SYN ring buffer. Source/port capacities,
-ring-buffer delivery, and evidence windows are bounded. Dropped or stale events,
-map capacity misses, slow polling, and evidence-window saturation reset affected
-detection windows instead of triggering automatic bans. The ring emitter caps
-SYN events at 10,000 per CPU per second. A saturated port map stays visibly
-incomplete until restart. Source entries idle for two minutes are reclaimed;
-source and port detail is best-effort. Global packet counters continue independently.
+Counter maps are separate from the SYN ring buffer. Source, port, and IP-detail
+capacity misses are reported separately. Lost/stale SYN events, source-map
+misses, slow polling, and detector saturation reset detection windows and suspend
+new automatic bans. Port/IP-detail misses mark traffic detail incomplete while
+detectors with complete inputs continue. Health shows the reason, affected scope,
+and collected map occupancy. The ring emitter caps SYN events at 10,000 per CPU
+per second. Global packet counters continue independently.
+
+Port and IP-detail maps use two banks. Each poll switches banks, waits for packet
+writers to finish, collects the inactive bank, and clears its slots. Port churn
+across intervals therefore no longer requires restarting the server. An interval
+with more distinct keys than its configured capacity can still overflow; misses
+remain visible and the next rotation frees those slots. Source entries idle for
+two minutes are reclaimed, with new counter lifetimes tracked separately.
 
 Rule updates populate an inactive map bank before switching the control word.
 Temporary deadlines are enforced against kernel monotonic time, even between
@@ -144,17 +151,43 @@ absent while the service is down. Observe mode and manual mode persist too.
 ## History and resources
 
 SQLite uses WAL and versioned migrations behind a bounded 64-job writer queue.
+File-backed history reads use a separate read connection and a 16-job queue.
 Minute traffic is retained for seven days; hourly summaries and security/audit
 records for 90 days. Traffic buckets include observed/passed/dropped totals,
 protocol/port detail, top 100 sources, and evidence completeness. Source detail is
 approximate top-N: the difference between aggregate totals and retained source
 counts is the other/untracked bucket. Raw packet events are not retained.
 
-Partial-minute writes merge across graceful restarts; hourly totals do not double
-count them. An abrupt crash can lose the unfinished minute. Storage failures are
-reported; unavailable intervals are not fabricated. Retention cleanup runs with
-minute writes. Use SQLite's online backup API or stop the service before copying
-the database; copying only the `.sqlite` file while WAL is active is insufficient.
+Select a source IP in Overview or Traffic, or enter an IPv4/IPv6 address in
+**Inspect a source IP**. The detail view associates it with destination addresses,
+interfaces, protocols, and destination ports. It includes packets/bytes, TCP
+SYN/SYN-ACK/RST indicators, Einblick pass/drop counts, first/last observation times,
+bounded source-port samples, and related detection events. Filters run before
+pagination. Unparsed ports are explicit; passing XDP does not mean a service
+accepted a connection.
+
+IP detail includes low-volume sources outside the top-100 summary, within
+`association_capacity` (4,096 per bank) and `detail_minute_capacity` (16,384 distinct
+groups per minute). Detail uses the configured seven-day minute and 90-day hourly
+retention. `detail_row_limit` bounds their combined rows to 1,000,000 by default;
+whole oldest buckets are pruned when full. This can shorten available history.
+The view reports omissions, collection gaps, and expired/uncollected history.
+The row cap limits logical growth, not SQLite file bytes; freed pages are reused.
+
+Detail checkpoints run every ten seconds and on graceful shutdown, with at most
+two pending batches. Retry identities prevent double counting, including hourly
+rollups and partial-minute restarts. An abrupt crash can lose an uncommitted
+checkpoint; the restart boundary is marked incomplete. Full queues retain gap
+metadata and omitted packet counts. Legacy aggregate history still checkpoints
+at minute boundaries and can lose an unfinished minute on abrupt exit.
+
+On the first schema-v1 upgrade, the SQLite backup API saves
+`<database>.schema-v1-backup`, then migrates transactionally to schema v2. Rules,
+settings, audit, and aggregate history remain. Rollback requires restoring this
+backup with the old image. Earlier IP-to-port associations cannot be reconstructed;
+capture starts with this deployment. Preserve the migration backup separately.
+Use SQLite's online backup API or stop the service before copying the database;
+copying only the `.sqlite` file while WAL is active is insufficient.
 
 History and event reads also cap serialized data at 4 MiB per query to bound response memory.
 
@@ -207,7 +240,9 @@ python3 scripts/smoke-test.py
 sudo env PATH="$PATH" unshare --net -- ./scripts/test-kernel.sh
 ```
 
-The isolated kernel harness covers verifier loading/attachment, IPv4/IPv6 and
+The isolated kernel harness covers native/generic verifier loading/attachment,
+port churn beyond capacity across intervals, explicit overflow/recovery,
+concurrent port/association bank switching, IPv4/IPv6 and
 VLAN/fragment source blocking, four IPv6 extension headers before TCP, SYN events,
 allowlist precedence, expiry without
 userspace cleanup, emergency disable, attachment conflict, and SIGKILL cleanup.

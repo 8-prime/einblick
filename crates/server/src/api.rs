@@ -35,6 +35,7 @@ pub struct App {
     pub db: Database,
     pub auth: Arc<Auth>,
     pub snapshot: Arc<RwLock<Snapshot>>,
+    pub live_traffic: Arc<RwLock<LiveTraffic>>,
     pub commands: mpsc::Sender<Command>,
     pub updates: broadcast::Sender<Snapshot>,
     pub shutdown: broadcast::Sender<()>,
@@ -98,6 +99,7 @@ pub fn router(app: App) -> Router {
         .route("/snapshot", get(snapshot))
         .route("/stream", get(stream))
         .route("/history", get(history))
+        .route("/sources/{ip}/traffic", get(source_traffic))
         .route("/events", get(events))
         .route("/rules", get(rules).post(add_rule))
         .route("/rules/{id}", axum::routing::delete(remove_rule))
@@ -162,7 +164,8 @@ async fn session(
     axum::Extension(s): axum::Extension<crate::auth::Session>,
 ) -> Json<serde_json::Value> {
     Json(
-        serde_json::json!({"csrf":s.csrf,"management_allowlist":app.config.management_allowlist,"thresholds":app.config.detection}),
+        serde_json::json!({"csrf":s.csrf,"management_allowlist":app.config.management_allowlist,"thresholds":app.config.detection,
+            "detail_limits":{"minute_days":app.config.retention.minute_days,"hourly_days":app.config.retention.hourly_days,"row_limit":app.config.detail_row_limit}}),
     )
 }
 async fn logout(State(app): State<App>, headers: HeaderMap) -> Response {
@@ -229,11 +232,65 @@ async fn history(
 struct EventsQuery {
     limit: Option<u32>,
     before: Option<i64>,
+    ip: Option<IpAddr>,
+}
+#[derive(Deserialize)]
+struct SourceTrafficQuery {
+    from: Option<i64>,
+    to: Option<i64>,
+    resolution: Option<String>,
+    protocol: Option<u8>,
+    port: Option<u16>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+async fn source_traffic(
+    State(app): State<App>,
+    Path(ip): Path<String>,
+    Query(q): Query<SourceTrafficQuery>,
+) -> Result<Json<TrafficPage>, ApiError> {
+    let ip = ip
+        .parse::<IpAddr>()
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid IP address".into()))?;
+    if q.cursor.as_ref().is_some_and(|c| c.len() > 2048) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "cursor too long".into()));
+    }
+    let cursor = q
+        .cursor
+        .map(|c| serde_json::from_str::<TrafficCursor>(&c))
+        .transpose()
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid cursor".into()))?;
+    let now = unix_now();
+    let query = TrafficQuery {
+        ip,
+        resolution: q.resolution.unwrap_or("minute".into()),
+        from: q.from.unwrap_or(now - 86400),
+        to: q.to.unwrap_or(now),
+        protocol: q.protocol,
+        port: q.port,
+        cursor,
+        limit: q.limit.unwrap_or(100),
+    };
+    if !(1..=500).contains(&query.limit) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "limit must be between 1 and 500".into(),
+        ));
+    }
+    let live = app.live_traffic.read().await.for_query(&query);
+    Ok(Json(app.db.source_traffic(query, live).await?))
 }
 async fn events(
     State(app): State<App>,
     Query(q): Query<EventsQuery>,
 ) -> Result<Json<Vec<einblick_core::Event>>, ApiError> {
+    if let Some(ip) = q.ip {
+        return Ok(Json(
+            app.db
+                .events_for_source(ip, q.limit.unwrap_or(100), q.before.unwrap_or(i64::MAX))
+                .await?,
+        ));
+    }
     Ok(Json(
         app.db
             .events(q.limit.unwrap_or(100), q.before.unwrap_or(i64::MAX))
@@ -369,6 +426,7 @@ mod tests {
             db: Database::open(":memory:").unwrap(),
             auth: Arc::new(Auth::new("test password long enough").unwrap()),
             snapshot: Arc::new(RwLock::new(Snapshot::default())),
+            live_traffic: Arc::new(RwLock::new(LiveTraffic::default())),
             commands: tx,
             updates,
             shutdown: broadcast::channel(1).0,

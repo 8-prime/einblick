@@ -2,7 +2,11 @@ use crate::backend::{Backend, Observation};
 use anyhow::{Result, ensure};
 use einblick_core::{detector::Detector, storage::Database, *};
 use ipnet::IpNet;
-use std::{collections::HashMap, net::IpAddr, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
+    net::IpAddr,
+    sync::Arc,
+};
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 
 pub enum Action {
@@ -45,6 +49,24 @@ pub struct Monitor {
     last_error: Option<String>,
     last_poll: std::time::Instant,
     last_tick: i64,
+    detection_complete: bool,
+    detail_complete: bool,
+    reasons: Vec<String>,
+    maps: Vec<MapHealth>,
+    pub live_traffic: Arc<RwLock<LiveTraffic>>,
+    detail: BTreeMap<TrafficKey, TrafficRecord>,
+    detail_keys: BTreeSet<TrafficKey>,
+    detail_queue: VecDeque<DetailBatch>,
+    detail_writer: Option<tokio::task::JoinHandle<Result<()>>>,
+    detail_run: String,
+    detail_sequence: u64,
+    detail_from: i64,
+    detail_bucket: i64,
+    detail_ok: bool,
+    detail_omitted: u64,
+    detail_gap_from: Option<i64>,
+    detail_storage_ok: bool,
+    evidence_gap: bool,
 }
 impl Monitor {
     pub async fn new(
@@ -92,6 +114,24 @@ impl Monitor {
             last_error: None,
             last_poll: std::time::Instant::now(),
             last_tick: 0,
+            detection_complete: false,
+            detail_complete: false,
+            reasons: vec!["Waiting for first observation".into()],
+            maps: vec![],
+            live_traffic: Arc::new(RwLock::new(LiveTraffic::default())),
+            detail: BTreeMap::new(),
+            detail_keys: BTreeSet::new(),
+            detail_queue: VecDeque::new(),
+            detail_writer: None,
+            detail_run: hex::encode(rand::random::<[u8; 16]>()),
+            detail_sequence: 1,
+            detail_from: unix_now(),
+            detail_bucket: unix_now() / 60 * 60,
+            detail_ok: true,
+            detail_omitted: 0,
+            detail_gap_from: None,
+            detail_storage_ok: true,
+            evidence_gap: false,
         })
     }
     pub async fn run(
@@ -104,11 +144,34 @@ impl Monitor {
         loop {
             tokio::select! {
                 _=stop.recv()=>break,
-                command=commands.recv()=> {let Some(command)=command else{break};let result=self.command(command.action).await;self.publish(Totals::default(),false).await;let _=command.reply.send(result);},
+                command=commands.recv()=> {let Some(command)=command else{break};let result=self.command(command.action).await;self.publish(Totals::default(),self.detection_complete && self.detail_complete).await;let _=command.reply.send(result);},
                 _=interval.tick()=>self.tick().await,
             }
         }
         // Persist partial minute, then owned links detach when backend is dropped.
+        if let Some(writer) = self.detail_writer.take() {
+            match writer.await {
+                Ok(Ok(())) => {
+                    self.detail_queue.pop_front();
+                }
+                other => tracing::error!(?other, "detail checkpoint failed at shutdown"),
+            }
+        }
+        self.flush_detail(unix_now());
+        while let Some(batch) = self.detail_queue.pop_front() {
+            if let Err(e) = self
+                .db
+                .detail_checkpoint(
+                    batch,
+                    self.config.retention.clone(),
+                    self.config.detail_row_limit,
+                )
+                .await
+            {
+                tracing::error!(%e,"final detail checkpoint failed");
+                break;
+            }
+        }
         if self.bucket.totals.packets > 0
             && let Err(e) = self
                 .db
@@ -187,7 +250,8 @@ impl Monitor {
                     "configure management_allowlist and acknowledge observe-mode evidence first"
                 );
                 ensure!(
-                    !automatic || (self.storage_ok && self.enforcement_ok),
+                    !automatic
+                        || (self.storage_ok && self.detail_storage_ok && self.enforcement_ok),
                     "resolve health errors before enabling automatic bans"
                 );
                 self.db.set_mode(automatic, blocking, now).await?;
@@ -251,6 +315,18 @@ impl Monitor {
         let elapsed = self.last_poll.elapsed().as_secs_f64();
         self.last_poll = std::time::Instant::now();
         let now = unix_now();
+        if self.clock_changed(now, elapsed) {
+            self.detail_ok = false;
+            self.detail_gap_from = Some(self.detail_from.min(now));
+        }
+        self.pump_detail().await;
+        if now / 60 * 60 != self.detail_bucket {
+            self.flush_detail(now);
+            self.detail_keys.clear();
+            self.detail_bucket = now / 60 * 60;
+        } else if now - self.detail_from >= 10 {
+            self.flush_detail(now);
+        }
         if self.bucket.at != now / 60 * 60 {
             let old = std::mem::replace(
                 &mut self.bucket,
@@ -285,6 +361,11 @@ impl Monitor {
             Err(e) => {
                 self.last_error = Some(e.to_string());
                 self.detector.clear();
+                self.detection_complete = false;
+                self.detail_complete = false;
+                self.detail_ok = false;
+                self.evidence_gap = true;
+                self.reasons = vec![format!("Capture poll failed: {e}")];
                 self.publish(Totals::default(), false).await;
                 return;
             }
@@ -292,39 +373,84 @@ impl Monitor {
         self.process(now, elapsed, observation).await;
     }
     async fn process(&mut self, now: i64, elapsed: f64, o: Observation) {
+        let clock_changed = self.clock_changed(now, elapsed);
         self.last_tick = now;
-        let rate = o.totals.delta(&self.previous);
-        let mut complete =
-            o.complete && rate.event_loss == 0 && rate.map_full == 0 && elapsed <= 1.5;
+        let mut rate = o.totals.delta(&self.previous);
+        rate.port_misses = o.port_misses;
+        rate.association_misses = o.association_misses;
+        let mut complete = o.complete
+            && rate.event_loss == 0
+            && rate.source_misses == 0
+            && elapsed <= 1.5
+            && !self.evidence_gap;
+        self.detail_complete = o.detail_complete
+            && rate.port_misses == 0
+            && rate.association_misses == 0
+            && elapsed <= 1.5
+            && !clock_changed;
+        self.maps = o.maps;
+        self.reasons.clear();
+        if self.evidence_gap {
+            self.reasons
+                .push("Rebuilding evidence after a capture gap".into());
+        }
+        self.evidence_gap = false;
+        for (hit, reason) in [
+            (
+                rate.source_misses > 0,
+                "Source map full; detection evidence incomplete",
+            ),
+            (
+                rate.port_misses > 0,
+                "Port map full; port summary incomplete",
+            ),
+            (
+                rate.association_misses > 0,
+                "IP detail map full; associations incomplete",
+            ),
+            (
+                rate.event_loss > 0,
+                "SYN events lost; detection evidence incomplete",
+            ),
+            (!o.complete, "Stale or truncated SYN evidence"),
+            (elapsed > 1.5, "Polling interval exceeded 1.5 seconds"),
+            (!o.detail_complete, "Detail map handover delayed"),
+            (
+                clock_changed,
+                "System clock changed; traffic detail timing incomplete",
+            ),
+        ] {
+            if hit {
+                self.reasons.push(reason.into());
+            }
+        }
         self.previous = o.totals;
         let mut sources = HashMap::new();
         let mut rates = vec![];
         let mut delta_sources = vec![];
         for s in o.sources {
-            let old = self.sources.get(&s.ip);
+            let old = self
+                .sources
+                .get(&s.ip)
+                .filter(|old| old.generation == s.generation);
             let delta = Source {
                 ip: s.ip,
                 packets: s.packets.saturating_sub(old.map_or(0, |v| v.packets)),
                 bytes: s.bytes.saturating_sub(old.map_or(0, |v| v.bytes)),
                 syns: s.syns.saturating_sub(old.map_or(0, |v| v.syns)),
+                generation: s.generation,
             };
             rates.push((s.ip, delta.packets, delta.syns));
             delta_sources.push(delta);
             sources.insert(s.ip, s);
         }
         self.sources = sources;
-        let mut ports = HashMap::new();
         let mut delta_ports = vec![];
         for p in o.ports {
             let k = (p.protocol, p.port);
-            let delta = p.packets.saturating_sub(*self.ports.get(&k).unwrap_or(&0));
-            delta_ports.push(Port {
-                packets: delta,
-                ..p
-            });
-            ports.insert(k, p.packets);
+            *self.ports.entry(k).or_default() += p.packets;
+            delta_ports.push(p);
         }
-        self.ports = ports;
         self.bucket.totals.add(&rate);
         self.bucket.complete &= complete;
         for s in delta_sources {
@@ -365,7 +491,34 @@ impl Monitor {
             complete,
         );
         complete &= self.detector.evidence_complete;
-        self.bucket.complete &= complete;
+        self.detection_complete = complete;
+        if !self.detector.evidence_complete && self.reasons.is_empty() {
+            self.reasons.push("Detector evidence window full".into());
+        }
+        self.detail_ok &= self.detail_complete;
+        self.detail_omitted += rate.association_misses;
+        for row in o.traffic {
+            let key = row.key();
+            if !self.detail_keys.contains(&key)
+                && self.detail_keys.len() >= self.config.detail_minute_capacity
+            {
+                self.detail_ok = false;
+                self.detail_complete = false;
+                self.detail_omitted += row.counts.packets;
+                continue;
+            }
+            self.detail_keys.insert(key.clone());
+            self.detail
+                .entry(key)
+                .and_modify(|old| old.merge(&row))
+                .or_insert(row);
+        }
+        if !self.detail_complete && self.reasons.is_empty() {
+            self.reasons
+                .push("Minute IP detail capacity reached".into());
+        }
+        self.bucket.complete &= complete && self.detail_complete;
+        self.publish_live(now).await;
         for mut d in detections {
             d.at = now;
             if let Err(e) = self
@@ -387,6 +540,7 @@ impl Monitor {
             if self.automatic
                 && self.blocking
                 && self.storage_ok
+                && self.detail_storage_ok
                 && self.enforcement_ok
                 && d.eligible
                 && !allowed
@@ -426,7 +580,7 @@ impl Monitor {
             }
         }
         self.reconcile().await;
-        self.publish(rate, complete).await;
+        self.publish(rate, complete && self.detail_complete).await;
     }
     async fn publish(&self, rate: Totals, complete: bool) {
         let (backend, attachments) = self.backend.description();
@@ -458,7 +612,11 @@ impl Monitor {
                 backend,
                 attachments,
                 telemetry_complete: complete,
-                storage_ok: self.storage_ok,
+                detection_complete: self.detection_complete,
+                detail_complete: self.detail_complete,
+                reasons: self.reasons.clone(),
+                maps: self.maps.clone(),
+                storage_ok: self.storage_ok && self.detail_storage_ok,
                 enforcement_ok: self.enforcement_ok,
                 last_error: self.last_error.clone(),
                 last_tick: self.last_tick,
@@ -466,6 +624,72 @@ impl Monitor {
         };
         *self.snapshot.write().await = snap.clone();
         let _ = self.updates.send(snap);
+    }
+    fn current_detail(&self, now: i64) -> DetailBatch {
+        DetailBatch {
+            run: self.detail_run.clone(),
+            sequence: self.detail_sequence,
+            from: self.detail_from.min(now),
+            to: now,
+            rows: self.detail.values().cloned().collect(),
+            complete: self.detail_ok && now >= self.detail_from,
+            omitted: self.detail_omitted,
+            gap_from: self.detail_gap_from,
+        }
+    }
+    fn clock_changed(&self, now: i64, elapsed: f64) -> bool {
+        self.last_tick > 0 && ((now - self.last_tick) as f64 - elapsed).abs() > 2.0
+    }
+    fn flush_detail(&mut self, now: i64) {
+        if self.detail_queue.len() < 2 {
+            self.detail_queue.push_back(self.current_detail(now));
+            self.detail_ok = true;
+            self.detail_omitted = 0;
+            self.detail_gap_from = None;
+        } else {
+            self.detail_storage_ok = false;
+            self.last_error = Some("Detail writer backpressure: checkpoint omitted".into());
+            self.detail_omitted += self.detail.values().map(|r| r.counts.packets).sum::<u64>();
+            self.detail_gap_from = Some(
+                self.detail_gap_from
+                    .unwrap_or(self.detail_from)
+                    .min(self.detail_from),
+            );
+            self.detail_ok = false;
+        }
+        self.detail.clear();
+        self.detail_sequence += 1;
+        self.detail_from = now;
+    }
+    async fn pump_detail(&mut self) {
+        if self.detail_writer.as_ref().is_some_and(|w| w.is_finished()) {
+            match self.detail_writer.take().unwrap().await {
+                Ok(Ok(())) => {
+                    self.detail_queue.pop_front();
+                    self.detail_storage_ok = self.detail_gap_from.is_none()
+                        && self.detail_queue.iter().all(|b| b.gap_from.is_none());
+                }
+                result => {
+                    self.detail_storage_ok = false;
+                    self.last_error = Some(format!("Detail checkpoint failed: {result:?}"));
+                }
+            }
+        }
+        if self.detail_writer.is_none()
+            && let Some(batch) = self.detail_queue.front().cloned()
+        {
+            let db = self.db.clone();
+            let retention = self.config.retention.clone();
+            let cap = self.config.detail_row_limit;
+            self.detail_writer = Some(tokio::spawn(async move {
+                db.detail_checkpoint(batch, retention, cap).await
+            }));
+        }
+    }
+    async fn publish_live(&self, now: i64) {
+        let mut batches: Vec<_> = self.detail_queue.iter().cloned().collect();
+        batches.push(self.current_detail(now));
+        *self.live_traffic.write().await = LiveTraffic { batches };
     }
 }
 
@@ -572,5 +796,89 @@ mod tests {
         // Emergency kernel disable works even if persisting the mode fails.
         assert!(m.command(Action::Emergency).await.is_err());
         assert!(!m.blocking && !m.automatic);
+    }
+    #[tokio::test]
+    async fn detail_map_loss_does_not_suspend_complete_detection_evidence() {
+        let mut m = monitor(true).await;
+        m.command(Action::Mode {
+            automatic: true,
+            blocking: true,
+            acknowledged: true,
+        })
+        .await
+        .unwrap();
+        let mut o = m.backend.poll().unwrap();
+        o.totals.port_misses = 7;
+        o.totals.association_misses = 3;
+        o.port_misses = 7;
+        o.association_misses = 3;
+        o.totals.map_full = 10;
+        m.process(unix_now(), 1.0, o).await;
+        let snapshot = m.snapshot.read().await;
+        assert!(snapshot.health.detection_complete);
+        assert!(!snapshot.health.detail_complete && !snapshot.health.telemetry_complete);
+        assert!(m.rules.iter().any(|r| r.actor == "detector"));
+    }
+    #[tokio::test]
+    async fn source_map_loss_still_suspends_bans() {
+        let mut m = monitor(true).await;
+        m.command(Action::Mode {
+            automatic: true,
+            blocking: true,
+            acknowledged: true,
+        })
+        .await
+        .unwrap();
+        let mut o = m.backend.poll().unwrap();
+        o.totals.source_misses = 1;
+        o.totals.map_full = 1;
+        m.process(unix_now(), 1.0, o).await;
+        assert!(m.rules.is_empty());
+        assert!(!m.detection_complete);
+    }
+    #[tokio::test]
+    async fn recreated_source_counters_start_a_new_baseline() {
+        let mut m = monitor(false).await;
+        let o = m.backend.poll().unwrap();
+        let source = o.sources[0].clone();
+        m.process(unix_now(), 1.0, o).await;
+        let mut o = m.backend.poll().unwrap();
+        let fresh = o.sources.iter_mut().find(|s| s.ip == source.ip).unwrap();
+        fresh.generation += 1;
+        fresh.packets = 5;
+        fresh.bytes = 500;
+        fresh.syns = 2;
+        m.process(unix_now() + 1, 1.0, o).await;
+        assert_eq!(
+            m.bucket
+                .sources
+                .iter()
+                .find(|s| s.ip == source.ip)
+                .unwrap()
+                .packets,
+            source.packets + 5
+        );
+    }
+    #[tokio::test]
+    async fn full_checkpoint_queue_carries_a_durable_gap_and_omitted_count() {
+        let mut m = monitor(false).await;
+        let now = m.detail_from;
+        m.flush_detail(now + 10);
+        m.flush_detail(now + 20);
+        let o = m.backend.poll().unwrap();
+        let packets = o.traffic.iter().map(|r| r.counts.packets).sum::<u64>();
+        for row in o.traffic {
+            m.detail.insert(row.key(), row);
+        }
+        m.flush_detail(now + 30);
+        assert_eq!(m.detail_queue.len(), 2);
+        assert!(m.detail.is_empty() && !m.detail_storage_ok);
+        assert_eq!(m.detail_gap_from, Some(now + 20));
+        m.detail_queue.pop_front();
+        m.flush_detail(now + 40);
+        let recovery = m.detail_queue.back().unwrap();
+        assert_eq!(recovery.gap_from, Some(now + 20));
+        assert_eq!(recovery.omitted, packets);
+        assert!(!recovery.complete);
     }
 }

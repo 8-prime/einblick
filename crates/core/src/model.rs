@@ -11,6 +11,12 @@ pub struct Totals {
     pub parse_limits: u64,
     pub event_loss: u64,
     pub map_full: u64,
+    #[serde(default)]
+    pub source_misses: u64,
+    #[serde(default)]
+    pub port_misses: u64,
+    #[serde(default)]
+    pub association_misses: u64,
 }
 impl Totals {
     pub fn delta(&self, old: &Self) -> Self {
@@ -22,6 +28,11 @@ impl Totals {
             parse_limits: self.parse_limits.saturating_sub(old.parse_limits),
             event_loss: self.event_loss.saturating_sub(old.event_loss),
             map_full: self.map_full.saturating_sub(old.map_full),
+            source_misses: self.source_misses.saturating_sub(old.source_misses),
+            port_misses: self.port_misses.saturating_sub(old.port_misses),
+            association_misses: self
+                .association_misses
+                .saturating_sub(old.association_misses),
         }
     }
     pub fn add(&mut self, b: &Self) {
@@ -32,6 +43,9 @@ impl Totals {
         self.parse_limits += b.parse_limits;
         self.event_loss += b.event_loss;
         self.map_full += b.map_full;
+        self.source_misses += b.source_misses;
+        self.port_misses += b.port_misses;
+        self.association_misses += b.association_misses;
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,6 +54,8 @@ pub struct Source {
     pub packets: u64,
     pub bytes: u64,
     pub syns: u64,
+    #[serde(default)]
+    pub generation: u64,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Port {
@@ -84,10 +100,20 @@ pub struct Health {
     pub backend: String,
     pub attachments: Vec<String>,
     pub telemetry_complete: bool,
+    pub detection_complete: bool,
+    pub detail_complete: bool,
+    pub reasons: Vec<String>,
+    pub maps: Vec<MapHealth>,
     pub storage_ok: bool,
     pub enforcement_ok: bool,
     pub last_error: Option<String>,
     pub last_tick: i64,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MapHealth {
+    pub name: String,
+    pub used: usize,
+    pub capacity: usize,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
