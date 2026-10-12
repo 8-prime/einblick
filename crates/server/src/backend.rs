@@ -598,6 +598,33 @@ mod kernel_tests {
         }
         b
     }
+    fn ipv6_extension_frame() -> Vec<u8> {
+        let mut packet = frame(true, false, false);
+        // Hop-by-hop, routing, destination options and AH, with different
+        // lengths, followed by TCP. Exercise all four variable-offset steps.
+        let mut extensions = vec![0; 60];
+        for (at, next, length) in [(0, 43, 0), (8, 60, 1), (24, 51, 2), (48, 6, 1)] {
+            extensions[at] = next;
+            extensions[at + 1] = length;
+        }
+        packet.splice(54..54, extensions);
+        packet[18..20].copy_from_slice(&80u16.to_be_bytes());
+        packet[20] = 0;
+        packet
+    }
+    #[test]
+    fn ipv6_extension_fixture_and_truncations() {
+        let frame = ipv6_extension_frame();
+        let packet = einblick_common::parse(&frame);
+        assert!(packet.has_address && packet.syn && !packet.limited);
+        assert_eq!(packet.port, 443);
+        assert_eq!(packet.protocol, 6);
+        assert_eq!(packet.source.family, 6);
+        for end in 0..frame.len() {
+            let packet = einblick_common::parse(&frame[..end]);
+            assert!(packet.limited && !packet.syn, "truncated at {end}");
+        }
+    }
     fn send(frame: &[u8]) -> Result<()> {
         let raw = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW, 3u16.to_be() as i32) };
         ensure!(raw >= 0, "raw socket: {}", std::io::Error::last_os_error());
@@ -663,6 +690,14 @@ mod kernel_tests {
                 .any(|(ip, p)| *ip == "192.0.2.1".parse::<IpAddr>().unwrap() && *p == 443),
             "TCP SYN event"
         );
+        send(&ipv6_extension_frame())?;
+        let obs = k.poll()?;
+        ensure!(
+            obs.syns
+                .iter()
+                .any(|(ip, port)| *ip == "2001:db8::1".parse::<IpAddr>().unwrap() && *port == 443),
+            "TCP SYN after four IPv6 extension headers"
+        );
         let now = einblick_core::unix_now();
         let mut rules = vec![
             Rule {
@@ -696,10 +731,11 @@ mod kernel_tests {
         send(&frame(true, false, false))?;
         send(&frame(false, true, false))?;
         send(&frame(false, false, true))?;
+        send(&ipv6_extension_frame())?;
         let after = k.poll()?.totals;
         ensure!(
-            after.dropped >= old.dropped + 4,
-            "IPv4, IPv6, VLAN and fragment source blocks"
+            after.dropped >= old.dropped + 5,
+            "IPv4, IPv6, VLAN, fragment and IPv6 extension source blocks"
         );
         k.reconcile(&rules, &["192.0.2.1/32".parse()?], true, now)?;
         let old = k.poll()?.totals;

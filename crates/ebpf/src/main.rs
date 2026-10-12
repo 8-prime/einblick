@@ -1,5 +1,6 @@
 #![no_std]
 #![no_main]
+#![feature(asm_experimental_arch)]
 use aya_ebpf::{bindings::xdp_action,helpers::{bpf_ktime_get_ns,bpf_xdp_get_buff_len},macros::{map,xdp},maps::{Array,HashMap,PerCpuArray,PerCpuHashMap,RingBuf,lpm_trie::{LpmTrie,Key}},programs::XdpContext};
 use einblick_common::*;
 
@@ -20,12 +21,25 @@ impl PacketRead for XdpPacket {
         if at > 16384 {
             return None;
         }
-        let pointer = self.start + at;
-        if pointer + 1 > self.end {
-            return None;
+        // Keep the pointer calculation, check and load in one opaque block.
+        // LLVM can otherwise merge checks for different offsets, then rebuild
+        // a pointer whose bounds the verifier no longer knows (notably after
+        // IPv6 extension headers). 256 represents a failed one-byte read.
+        let value: u64;
+        unsafe {
+            core::arch::asm!(
+                "{value} = 256",
+                "{pointer} += {offset}",
+                "if {pointer} >= {end} goto +1",
+                "{value} = *(u8 *)({pointer} + 0)",
+                value = out(reg) value,
+                pointer = inout(reg) self.start => _,
+                offset = in(reg) at,
+                end = in(reg) self.end,
+                options(nostack, readonly),
+            );
         }
-        // Only read after comparing the packet pointer directly with data_end.
-        Some(unsafe { (pointer as *const u8).read() })
+        if value < 256 { Some(value as u8) } else { None }
     }
 }
 

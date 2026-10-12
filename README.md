@@ -208,7 +208,8 @@ sudo env PATH="$PATH" unshare --net -- ./scripts/test-kernel.sh
 ```
 
 The isolated kernel harness covers verifier loading/attachment, IPv4/IPv6 and
-VLAN/fragment source blocking, SYN events, allowlist precedence, expiry without
+VLAN/fragment source blocking, four IPv6 extension headers before TCP, SYN events,
+allowlist precedence, expiry without
 userspace cleanup, emergency disable, attachment conflict, and SIGKILL cleanup.
 It refuses to run in the host network namespace and uses `setpriv` to load XDP
 with the production capabilities (`CAP_BPF`, `CAP_NET_ADMIN`, `CAP_PERFMON`,
