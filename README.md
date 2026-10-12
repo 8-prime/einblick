@@ -1,0 +1,212 @@
+# Einblick
+
+Self-hosted ingress observability and basic intrusion prevention. Rust/Aya XDP,
+SQLite history, and an embedded Svelte dashboard run in one container per server.
+
+The MVP includes IPv4/IPv6 source and destination-port visibility, packet/byte
+counters, TCP SYN attempt analysis, temporary automatic IP bans, manual permanent
+and CIDR rules, expiring allowlists, historical charts, and an enforcement audit.
+It starts in **observe mode**. HTTP log ingestion and subnet recommendations are
+future work.
+
+## Local container preview
+
+Generate `secrets/admin-password` using the commands below, then run:
+
+```sh
+docker compose -f docker-compose.demo.yml up --build -d
+```
+
+Open <http://127.0.0.1:9080> and sign in with that password. This preview uses
+synthetic traffic, its own data volume, and no BPF/network capabilities; it also
+works with rootless Docker. Select its Docker context or set `DOCKER_HOST` to its
+socket when using rootless Docker. Real network capture uses the deployment below.
+Stop the preview with `docker compose -f docker-compose.demo.yml down`.
+
+## Deploy
+
+Requirements: rootful Docker Compose, Linux 6.1 or newer with BPF/XDP support,
+x86-64, and an existing HTTPS reverse proxy. The configured interface must support
+owned BPF XDP links. Native XDP is preferred; generic XDP is the optional fallback.
+Einblick refuses legacy attachment and replacement of another XDP program.
+
+```sh
+cp einblick.example.toml einblick.toml
+mkdir -p secrets
+chmod 700 secrets
+# Write a unique administrator password (at least 12 bytes) to this file.
+# A password manager can generate it; the example uses a random secret.
+umask 077
+openssl rand -base64 32 > secrets/admin-password
+```
+
+Edit `einblick.toml`: set the actual host interface, the dashboard's public HTTPS
+origin, and your administrator/VPN address in `management_allowlist`. The example
+binds the web service to `127.0.0.1:9080`. This is separate from capture: XDP sees
+all ingress on selected interfaces, including forwarded/container traffic before
+host firewall/NAT handling.
+
+```sh
+docker compose up --build -d
+docker compose logs -f einblick
+```
+
+The container uses host networking, `CAP_BPF` and `CAP_NET_ADMIN`, unlimited
+memlock, a read-only root filesystem, and one writable `/data` volume. It does not
+require privileged mode, bpffs pinning, or an external database. Compose relaxes
+seccomp because Docker's default profile can deny the BPF syscall; capabilities
+and `no-new-privileges` still apply. SELinux/AppArmor policies must also permit
+BPF loading and network attachment. Startup errors explain missing permissions,
+map-budget failures, and verifier/attachment failures.
+
+Example Nginx location inside an existing TLS server:
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:9080;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_buffering off;
+    proxy_read_timeout 1h;
+}
+```
+
+Set `public_origin` to the exact HTTPS scheme and authority, without a trailing
+slash. List only immediate proxy peers in `trusted_proxies`; only these peers can
+supply `X-Real-IP` for login throttling. A proxy in its own container needs a
+reachable host bind address instead of localhost. Update the healthcheck address
+if changing port or binding to a specific address.
+
+Sign in with the mounted password. Authentication uses Argon2id, short-lived
+in-memory sessions (12 hours), HttpOnly/Secure/SameSite cookies, CSRF tokens, exact
+Origin checks for mutations, and bounded login attempts. Password rotation means
+replacing the secret and restarting; existing sessions are invalidated on restart.
+
+## Enforcement and evidence
+
+- **Observe:** records counters/detections and passes traffic, including stored
+  block rules. Detection thresholds are configured in TOML and displayed in Health.
+- **Manual:** applies address/CIDR allow and block rules. Adding a manual block
+  explicitly enables blocking. Allowlist matches always win, regardless of prefix
+  length; protected management ranges are loaded from configuration.
+- **Automatic:** adds ten-minute individual-IP bans by default. Activation requires
+  a configured management allowlist, acknowledgment of observe-mode evidence, and
+  healthy storage/enforcement. CIDR and permanent bans remain manual.
+- **Emergency disable:** switches off kernel blocking before writing restart
+  settings. If persistence fails, the dashboard reports that restart state was not
+  saved; resolve storage before restarting.
+
+Defaults: 25 distinct TCP ports/source/60 seconds, 1,000 SYNs/source/10 seconds,
+20,000 packets/source/second for three consecutive intervals, and an advisory
+300 SYNs/source/port/minute detector. Retransmissions count as attempts, while
+port scans deduplicate ports. `repeated_auto_ban` is disabled by default.
+
+These are packet metadata signals. Ingress-only XDP cannot confirm TCP sessions,
+closed ports, login failures, HTTP requests, or malicious intent. IPv6 extension
+parsing is bounded to four headers; fragments, ESP, jumbograms, unsupported L2
+headers, and malformed headers are counted as parsing limitations. Transport
+analysis is unavailable for these packets; safely extracted source addresses
+still participate in counters and enforcement. No payload is stored.
+
+Counter maps are separate from the SYN ring buffer. Source/port capacities,
+ring-buffer delivery, and evidence windows are bounded. Dropped or stale events,
+map capacity misses, slow polling, and evidence-window saturation reset affected
+detection windows instead of triggering automatic bans. The ring emitter caps
+SYN events at 10,000 per CPU per second. A saturated port map stays visibly
+incomplete until restart. Source entries idle for two minutes are reclaimed;
+source and port detail is best-effort. Global packet counters continue independently.
+
+Rule updates populate an inactive map bank before switching the control word.
+Temporary deadlines are enforced against kernel monotonic time, even between
+userspace ticks. Prefix compilation inherits longer-lived ancestor rules so an
+expired narrow prefix cannot mask an active broader rule. Rule status distinguishes
+persisted intent from applied state; failed updates are reported and retried.
+New automatic bans pause when audit storage or rule reconciliation fails.
+
+Owned, unpinned links detach on shutdown or crash, allowing traffic. Active stored
+rules and mode restore before attachment on restart. Enforcement is intentionally
+absent while the service is down. Observe mode and manual mode persist too.
+
+## History and resources
+
+SQLite uses WAL and versioned migrations behind a bounded 64-job writer queue.
+Minute traffic is retained for seven days; hourly summaries and security/audit
+records for 90 days. Traffic buckets include observed/passed/dropped totals,
+protocol/port detail, top 100 sources, and evidence completeness. Source detail is
+approximate top-N: the difference between aggregate totals and retained source
+counts is the other/untracked bucket. Raw packet events are not retained.
+
+Partial-minute writes merge across graceful restarts; hourly totals do not double
+count them. An abrupt crash can lose the unfinished minute. Storage failures are
+reported; unavailable intervals are not fabricated. Retention cleanup runs with
+minute writes. Use SQLite's online backup API or stop the service before copying
+the database; copying only the `.sqlite` file while WAL is active is insufficient.
+
+History and event reads also cap serialized data at 4 MiB per query to bound response memory.
+
+The initial target is a two-vCPU server, 100,000 ingress packets/second, 256 MiB
+userspace RSS, and a separate 64 MiB kernel-map budget. These are validation
+**targets**, not measured throughput claims. Map allocation is conservatively
+estimated against the host's possible CPU count; a large host may require smaller
+map capacities even when the container has a two-CPU quota. Compose caps total
+container memory at 320 MiB to accommodate both budgets. Database disk usage
+has retention limits but no fixed byte quota.
+
+## Develop and validate
+
+Use pnpm, not npm, for the frontend. The pinned version is in its package manifest.
+Install Rust stable, nightly-2026-10-12 with `rust-src`, and the official prebuilt
+[bpf-linker v0.11.1](https://github.com/aya-rs/bpf-linker/releases/tag/v0.11.1) on PATH.
+[Aya's XDP guide](https://aya-rs.dev/book/programs/xdp) describes the underlying
+attachment/model; [kernel LPM documentation](https://www.kernel.org/doc/html/v6.9/bpf/map_lpm_trie.html)
+describes prefix lookup.
+
+```sh
+./scripts/build.sh
+cargo test --locked --workspace
+cargo clippy --locked --workspace --all-targets -- -D warnings
+pnpm --dir frontend check
+```
+
+Without kernel privileges, build the dashboard and a mock-only binary:
+
+```sh
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend build
+cargo build --locked
+# Create secrets/admin-password as above.
+cargo run -- --config einblick.mock.toml
+```
+
+Open `http://127.0.0.1:9080`. Mock mode is labeled prominently; bans affect synthetic
+traffic only. `pnpm --dir frontend dev` also offers frontend development with an
+API proxy; set the mock `public_origin` to that development origin for login.
+Production binaries built by the Dockerfile/build script embed both web assets
+and eBPF. A plain Cargo build has no eBPF object unless
+`EINBLICK_EBPF_OBJECT=/absolute/path/to/einblick-ebpf` is set; live capture fails
+explicitly rather than silently using mock traffic.
+
+```sh
+python3 scripts/smoke-test.py
+# Prepare binaries as your normal user, then test on a privileged Linux host:
+./scripts/prepare-kernel-tests.sh
+sudo env PATH="$PATH" unshare --net -- ./scripts/test-kernel.sh
+```
+
+The isolated kernel harness covers verifier loading/attachment, IPv4/IPv6 and
+VLAN/fragment source blocking, SYN events, allowlist precedence, expiry without
+userspace cleanup, emergency disable, attachment conflict, and SIGKILL cleanup.
+It refuses to run in the host network namespace. The mock HTTP test covers
+sessions, manual rules, mode persistence, SSE shutdown, restoration, history,
+audit, and emergency disable. CI runs Rust/Svelte checks, builds the image, and runs the isolated kernel and mock HTTP tests on its privileged runner.
+
+For performance acceptance, benchmark native XDP on a two-vCPU Linux host with an
+external traffic generator: compare pass-through, observe, and block modes using
+100kpps mixes of TCP SYN/ACK, UDP, IPv4/IPv6 and distributed sources for 60 seconds.
+Record offered/received packets, counter deltas, event/map loss, CPU, RSS, kernel
+map memory and time-to-detection. Repeat with scan/flood input and queue/map
+saturation. A veth test validates behavior; it is not a NIC throughput benchmark.
+
+See [docs/API.md](docs/API.md) for the HTTP contract and
+[docs/VALIDATION.md](docs/VALIDATION.md) for checks performed during implementation.

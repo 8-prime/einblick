@@ -1,0 +1,48 @@
+services:
+  einblick:
+    build: .
+    image: einblick:local
+    platform: linux/amd64
+    network_mode: host
+    restart: unless-stopped
+    cap_drop: [ALL]
+    cap_add: [BPF, NET_ADMIN]
+    # Docker's default seccomp profile may reject bpf(); capabilities still apply.
+    security_opt:
+      - no-new-privileges:true
+      - seccomp:unconfined
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    volumes:
+      - einblick-data:/data
+      - ./einblick.toml:/etc/einblick.toml:ro
+    secrets:
+      - source: admin-password
+        target: admin-password
+    environment:
+      RUST_LOG: einblick=info
+      EINBLICK_HEALTH_ADDRESS: 127.0.0.1:9080
+    healthcheck:
+      test: [CMD, /usr/local/bin/einblick, --healthcheck]
+      interval: 15s
+      timeout: 4s
+      start_period: 10s
+    stop_grace_period: 10s
+    # Userspace target (256 MiB) plus separate kernel-map budget (64 MiB).
+    mem_limit: 320m
+    cpus: 2
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+volumes:
+  einblick-data:
+secrets:
+  admin-password:
+    file: ./secrets/admin-password

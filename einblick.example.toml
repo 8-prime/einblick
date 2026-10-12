@@ -1,0 +1,28 @@
+# Copy to einblick.toml and set your actual interface and public origin.
+bind = "127.0.0.1:9080"
+public_origin = "https://einblick.example.com"
+trusted_proxies = ["127.0.0.1/32", "::1/128"]
+interfaces = ["eth0"]
+generic_fallback = true
+mock = false
+secure_cookies = true
+database = "/data/einblick.sqlite"
+password_file = "/run/secrets/admin-password"
+source_capacity = 4096
+port_capacity = 4096
+ring_bytes = 1048576
+# Protect your actual administrator / VPN address before enabling automatic bans.
+management_allowlist = []
+
+[detection]
+scan_ports = 25
+syns_10s = 1000
+flood_pps = 20000
+repeated_syns_60s = 300
+repeated_auto_ban = false
+ban_seconds = 600
+
+[retention]
+minute_days = 7
+hourly_days = 90
+event_days = 90

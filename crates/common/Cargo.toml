@@ -1,0 +1,11 @@
+[package]
+name = "einblick-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+userspace = ["dep:aya"]
+
+[dependencies]
+aya = { version = "0.14", optional = true }

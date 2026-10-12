@@ -1,0 +1,18 @@
+[package]
+name = "einblick-ebpf"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[dependencies]
+aya-ebpf = "0.2.1"
+einblick-common = { path = "../common" }
+
+[[bin]]
+name = "einblick-ebpf"
+path = "src/main.rs"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

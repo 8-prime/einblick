@@ -1,0 +1,7 @@
+bind = "127.0.0.1:9080"
+public_origin = "http://127.0.0.1:9080"
+mock = true
+secure_cookies = false
+database = "data/mock.sqlite"
+password_file = "secrets/admin-password"
+management_allowlist = ["192.0.2.24/32"]

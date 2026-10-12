@@ -1,0 +1,39 @@
+services:
+  einblick:
+    build: .
+    image: einblick:local
+    platform: linux/amd64
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9080:9080"
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,noexec,nosuid
+    volumes:
+      - einblick-demo-data:/data
+      - ./einblick.demo.toml:/etc/einblick.toml:ro
+    secrets:
+      - admin-password
+    environment:
+      RUST_LOG: einblick=info
+    healthcheck:
+      test: [CMD, /usr/local/bin/einblick, --healthcheck]
+      interval: 15s
+      timeout: 4s
+      start_period: 10s
+    stop_grace_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  einblick-demo-data:
+
+secrets:
+  admin-password:
+    file: ./secrets/admin-password

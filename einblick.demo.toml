@@ -1,0 +1,8 @@
+# Local Docker preview: synthetic traffic, no host packet capture or enforcement.
+bind = "0.0.0.0:9080"
+public_origin = "http://127.0.0.1:9080"
+mock = true
+secure_cookies = false
+database = "/data/einblick.sqlite"
+password_file = "/run/secrets/admin-password"
+management_allowlist = ["192.0.2.24/32"]

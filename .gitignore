@@ -1,0 +1,9 @@
+/target/
+/crates/ebpf/target/
+/frontend/node_modules/
+/frontend/dist/
+/data/
+/secrets/
+*.sqlite*
+
+__pycache__/
