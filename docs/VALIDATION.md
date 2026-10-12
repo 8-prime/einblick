@@ -70,6 +70,23 @@ The earlier successful Docker image build predates this correction. Corrected
 runtime verifier acceptance and enforcement still require the privileged target
 host. A static ELF check and compilation are not substitutes for that validation.
 
+The subsequent `R5 tried to add from different maps, paths or scalars` rejection
+occurred on the second iteration of Aya's `memset` fallback, while initializing
+the parser's 24-byte stack value. bpf-linker's default ordered memory expansion
+disables generic memset expansion, leaving calls to that fallback for both the
+parser value and the 40-byte source counters. The eBPF crate's build script now
+passes `--disable-expand-memcpy-in-order` so fixed-size operations compile to
+loads/stores. Rebuilt object inspection confirmed that both memset call
+relocations disappeared; the parser initialization uses three fixed 64-bit
+stores. This setting applies to Docker and local Cargo builds alike.
+
+The embedding validator rejects references to memory fallback functions while
+allowing their unused exported definitions. An ELF regression test covers that
+distinction for memset, memcpy, memmove, memcmp, and bcmp. The privileged harness
+now drops `CAP_PERFMON` and `CAP_SYS_ADMIN` before loading XDP, matching production
+verifier restrictions; injected frames additionally require `CAP_NET_RAW`.
+Runtime acceptance with these changes remains unverified locally.
+
 The isolated privileged harness and CI workflow are provided for these checks.
 Prepare binaries as a normal user, then run:
 

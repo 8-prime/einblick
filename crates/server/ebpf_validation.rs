@@ -1,13 +1,32 @@
-use object::{Object, ObjectSection, ObjectSymbol};
+use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
-/// Catch compiler-generated panic paths and malformed function endings before
-/// embedding an object. This does not replace the kernel's actual verifier.
+/// Catch compiler-generated panic paths, memory calls and malformed function
+/// endings before embedding an object. This does not replace the kernel verifier.
 pub fn validate(bytes: &[u8]) -> Result<(), String> {
     let file = object::File::parse(bytes).map_err(|e| format!("invalid eBPF object: {e}"))?;
     if file.format() != object::BinaryFormat::Elf
         || file.architecture() != object::Architecture::Bpf
     {
         return Err("expected an eBPF ELF object".into());
+    }
+    for section in file.sections() {
+        if section.kind() != object::SectionKind::Text {
+            continue;
+        }
+        for (_, relocation) in section.relocations() {
+            let RelocationTarget::Symbol(index) = relocation.target() else {
+                continue;
+            };
+            let symbol = file.symbol_by_index(index).map_err(|e| e.to_string())?;
+            let name = symbol.name().map_err(|e| e.to_string())?;
+            if matches!(name, "memset" | "memcpy" | "memmove" | "memcmp" | "bcmp") {
+                return Err(format!(
+                    "eBPF object calls {name}; fixed-size memory operations must be expanded \
+                     into loads/stores for restricted capabilities \
+                     (build with --disable-expand-memcpy-in-order)"
+                ));
+            }
+        }
     }
     let mut ingress = false;
     for symbol in file.symbols() {

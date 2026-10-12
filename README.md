@@ -208,7 +208,9 @@ sudo env PATH="$PATH" unshare --net -- ./scripts/test-kernel.sh
 The isolated kernel harness covers verifier loading/attachment, IPv4/IPv6 and
 VLAN/fragment source blocking, SYN events, allowlist precedence, expiry without
 userspace cleanup, emergency disable, attachment conflict, and SIGKILL cleanup.
-It refuses to run in the host network namespace. The mock HTTP test covers
+It refuses to run in the host network namespace and uses `setpriv` to load XDP
+with the production capability restrictions (no `CAP_PERFMON`/`CAP_SYS_ADMIN`;
+the packet injector additionally needs `CAP_NET_RAW`). The mock HTTP test covers
 sessions, manual rules, mode persistence, SSE shutdown, restoration, history,
 audit, and emergency disable. CI runs Rust/Svelte checks, builds the image, and runs the isolated kernel and mock HTTP tests on its privileged runner.
 

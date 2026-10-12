@@ -27,7 +27,10 @@ else:
     raise SystemExit("Run scripts/prepare-kernel-tests.sh as your normal user first.")
 PYTHON
 )
-"$test_binary" --exact backend::kernel_tests::xdp_namespace_rules_and_counters --ignored --nocapture
+# Exercise the same verifier restrictions as production: root with no
+# CAP_PERFMON or CAP_SYS_ADMIN. NET_RAW is only needed for injected test frames.
+setpriv --bounding-set=-all,+bpf,+net_admin,+net_raw -- \
+  "$test_binary" --exact backend::kernel_tests::xdp_namespace_rules_and_counters --ignored --nocapture
 # Verify crash cleanup with a real server process and an unpinned XDP link.
 dir=$(mktemp -d)
 trap 'if [[ -n ${pid:-} ]]; then kill "$pid" 2>/dev/null || true; fi; rm -rf "$dir"' EXIT
@@ -41,7 +44,8 @@ password_file = "$dir/password"
 source_capacity = 128
 port_capacity = 128
 CONFIG
-./target/release/einblick --config "$dir/config.toml" > "$dir/server.log" 2>&1 &
+setpriv --bounding-set=-all,+bpf,+net_admin -- \
+  ./target/release/einblick --config "$dir/config.toml" > "$dir/server.log" 2>&1 &
 pid=$!
 for i in {1..30}; do
   if EINBLICK_HEALTH_ADDRESS=127.0.0.1:19080 ./target/release/einblick --healthcheck; then break; fi
