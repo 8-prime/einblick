@@ -1,5 +1,5 @@
 //! Only two Docker discovery GETs are issued. No Docker mutation or exec API.
-use super::{PublishedEndpoint, SOCKET_LIMIT};
+use super::{ContainerAddress, PublishedEndpoint, SOCKET_LIMIT};
 use anyhow::{Context, Result, ensure};
 use einblick_core::{ApplicationEvidence, ApplicationMethod, application_text, unix_now};
 use http_body_util::{BodyExt, Empty};
@@ -102,7 +102,13 @@ async fn get(socket: &str, path: &str) -> Result<Vec<u8>> {
     .await
 }
 
-pub(super) async fn discover(socket: &str) -> Result<Vec<PublishedEndpoint>> {
+#[derive(Default)]
+pub(super) struct Discovery {
+    pub published: Vec<PublishedEndpoint>,
+    pub addresses: Vec<ContainerAddress>,
+}
+
+pub(super) async fn discover(socket: &str) -> Result<Discovery> {
     tokio::time::timeout(Duration::from_secs(3), async {
         let version: Version = serde_json::from_slice(&get(socket, "/version").await?)?;
         ensure!(
@@ -125,13 +131,13 @@ pub(super) async fn discover(socket: &str) -> Result<Vec<PublishedEndpoint>> {
     .context("Docker discovery timeout")?
 }
 
-fn endpoints(bytes: &[u8], observed: i64) -> Result<Vec<PublishedEndpoint>> {
+fn endpoints(bytes: &[u8], observed: i64) -> Result<Discovery> {
     let containers: Vec<Container> = serde_json::from_slice(bytes)?;
     ensure!(
         containers.len() <= 1024,
         "Docker container count exceeds limit"
     );
-    let mut endpoints = vec![];
+    let mut discovery = Discovery::default();
     for container in containers {
         ensure!(
             container.id.len() == 64 && container.id.bytes().all(|b| b.is_ascii_hexdigit()),
@@ -155,6 +161,30 @@ fn endpoints(bytes: &[u8], observed: i64) -> Result<Vec<PublishedEndpoint>> {
             observed_from: observed,
             observed_to: observed,
         };
+        // Addresses are collected independently of exposed/published ports.
+        // Outbound clients (including kernel WireGuard) need neither a Docker
+        // port declaration nor an observable userspace socket owner.
+        for network in container.network_settings.networks.values() {
+            for address in [&network.address, &network.ipv6]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+            {
+                let address: IpAddr = address.parse()?;
+                if address.is_unspecified() || address.is_loopback() {
+                    continue;
+                }
+                let mut application = application.clone();
+                application.method = ApplicationMethod::NatContainer;
+                discovery.addresses.push(ContainerAddress {
+                    address,
+                    application,
+                });
+                ensure!(
+                    discovery.addresses.len() <= SOCKET_LIMIT,
+                    "Docker address count exceeds limit"
+                );
+            }
+        }
         for port in container.ports {
             let protocol = match port.protocol.as_str() {
                 "tcp" => 6,
@@ -167,7 +197,7 @@ fn endpoints(bytes: &[u8], observed: i64) -> Result<Vec<PublishedEndpoint>> {
                 } else {
                     port.ip.parse()?
                 };
-                endpoints.push(PublishedEndpoint {
+                discovery.published.push(PublishedEndpoint {
                     address,
                     port: public,
                     protocol,
@@ -181,7 +211,7 @@ fn endpoints(bytes: &[u8], observed: i64) -> Result<Vec<PublishedEndpoint>> {
                     .into_iter()
                     .filter(|s| !s.is_empty())
                 {
-                    endpoints.push(PublishedEndpoint {
+                    discovery.published.push(PublishedEndpoint {
                         address: address.parse()?,
                         port: port.private,
                         protocol,
@@ -190,12 +220,12 @@ fn endpoints(bytes: &[u8], observed: i64) -> Result<Vec<PublishedEndpoint>> {
                 }
             }
             ensure!(
-                endpoints.len() <= SOCKET_LIMIT,
+                discovery.published.len() <= SOCKET_LIMIT,
                 "Docker endpoint count exceeds limit"
             );
         }
     }
-    Ok(endpoints)
+    Ok(discovery)
 }
 
 #[cfg(test)]
@@ -209,7 +239,8 @@ mod tests {
             "Ports":[{"IP":"0.0.0.0","PrivatePort":80,"PublicPort":8080,"Type":"tcp"},
                 {"IP":"::","PrivatePort":53,"PublicPort":5353,"Type":"udp"}],
             "NetworkSettings":{"Networks":{"default":{"IPAddress":"172.18.0.2","GlobalIPv6Address":"fd00::2"}}}}]);
-        let endpoints = endpoints(&serde_json::to_vec(&data).unwrap(), 123).unwrap();
+        let discovery = endpoints(&serde_json::to_vec(&data).unwrap(), 123).unwrap();
+        let endpoints = discovery.published;
         assert!(
             endpoints
                 .iter()
@@ -234,5 +265,21 @@ mod tests {
                 .iter()
                 .all(|e| e.application.name == "web-1" && e.application.observed_from == 123)
         );
+    }
+
+    #[test]
+    fn collects_nat_container_addresses_without_published_ports_or_pid() {
+        let data = serde_json::json!([{"Id":"b".repeat(64),"Names":["/arr-stack-gluetun-1"],
+            "Labels":{"com.docker.compose.service":"gluetun"}, "Ports":[],
+            "NetworkSettings":{"Networks":{"vpn":{"IPAddress":"172.30.0.2", "GlobalIPv6Address":"fd00::2"}}}}]);
+        let discovery = endpoints(&serde_json::to_vec(&data).unwrap(), 123).unwrap();
+        assert!(discovery.published.is_empty());
+        assert_eq!(discovery.addresses.len(), 2);
+        for endpoint in discovery.addresses {
+            assert_eq!(endpoint.application.name, "arr-stack-gluetun-1");
+            assert_eq!(endpoint.application.service.as_deref(), Some("gluetun"));
+            assert_eq!(endpoint.application.method, ApplicationMethod::NatContainer);
+            assert!(endpoint.application.pid.is_none());
+        }
     }
 }

@@ -174,7 +174,9 @@ pagination. Unparsed ports are explicit; passing XDP does not mean a service
 accepted a connection.
 
 The detail table also shows local application/service candidates from recorded
-socket ownership, optional Docker mappings, or configured labels. Discovery runs
+socket ownership, optional Docker published-port/NAT container mappings, or
+configured labels. NAT mapping also covers outbound container connections and
+kernel WireGuard transports without a process PID. Discovery runs
 as a child of the existing executable in the same image/container. Production
 Compose adds a host-proc mount and inspection capabilities, which the HTTP parent
 drops before creating runtime threads. Add `[applications] enabled = true` to an

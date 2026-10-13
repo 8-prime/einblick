@@ -25,6 +25,10 @@ services:
       - einblick-data:/data
       - ./einblick.toml:/etc/einblick.toml:ro
       - /proc:/host/proc:ro
+      # Optional Docker published-port/NAT attribution. Also set
+      # applications.docker_socket = "/var/run/docker.sock" in einblick.toml.
+      # A :ro socket mount still grants Docker daemon API access.
+      # - /var/run/docker.sock:/var/run/docker.sock:ro
     secrets:
       - source: admin-password
         target: admin-password

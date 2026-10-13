@@ -1,5 +1,25 @@
 # Implementation validation — 2026-10-12
 
+## NAT container attribution — 2026-10-13
+
+- The collector now joins read-only host conntrack dumps with optional Docker
+  container addresses, including containers without published ports and kernel
+  WireGuard transports without process/PID ownership. `nat_container` is endpoint
+  evidence; it does not identify applications carried inside encrypted tunnels.
+- Regressions cover the observed Gluetun UDP NAT tuple, IPv6 TCP DNAT, changed
+  destination ports, malformed/truncated/duplicate netlink attributes, nondefault
+  zones, source/destination/protocol/peer-port mismatches, stale/future evidence,
+  snapshot IPC round trips, and unchanged traffic counters.
+- Formatting, workspace tests (70 passed), strict Clippy, Svelte check, and the
+  frontend production build passed. Ordinary tests exclude the privileged XDP
+  test, the new real-kernel NAT test, and the manual SQLite resource measurement.
+- The isolated kernel harness now includes a real UDP SNAT exchange with a changed
+  host port and validates the new conntrack dump using only NET_ADMIN. This
+  privileged check has not run locally: root execution and iptables are unavailable
+  in the current environment. No homeserver deployment or live Docker integration
+  has been performed. Enable Docker socket discovery and rebuild/recreate the
+  service to validate new traffic on the deployment.
+
 ## Application attribution — 2026-10-13
 
 - Same-image child collector exercised against real unprivileged TCP/UDP sockets
@@ -32,7 +52,8 @@
   validation here comprises compiler/build and embedded HTTP checks.
 
 Runtime setup and supported coverage are in `APPLICATION_ATTRIBUTION.md`. Exact
-TCP-client flow attribution, arbitrary DNAT, and proxy upstream/log attribution
+Host TCP-client process attribution, NAT outside the supported Docker/default-zone
+mapping, and proxy upstream/log attribution
 remain future extensions. Rootful Docker permission/LSM profiles, Docker daemon
 integration on a live deployment, long-running process/port churn, and host
 CPU/RSS/disk performance remain deployment validation tasks.

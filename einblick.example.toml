@@ -28,7 +28,8 @@ stale_seconds = 10
 # Serialized application evidence beyond the per-row status allowance, per batch.
 batch_evidence_bytes = 8388608
 # Optional: mount the Docker daemon socket and set its path for automatic
-# container names / published ports. A :ro socket mount still grants API access.
+# container names, published ports, and outbound NAT flows (including kernel
+# WireGuard). A :ro socket mount still grants API access.
 docker_socket = ""
 # Service labels also work without automatic discovery. Protocol 6=TCP, 17=UDP.
 # [[applications.services]]

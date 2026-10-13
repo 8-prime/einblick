@@ -81,9 +81,11 @@ also impose access restrictions. The default policy is documented in
 
 The Rust entrypoint starts a child of the same executable in internal collector
 mode before creating threads or opening administrator secrets, SQLite, or XDP
-descriptors. The child retains only inspection capabilities. The HTTP/monitor
-parent clears those capabilities and ambient capabilities and sets no-new-privileges
-before creating runtime threads. Bounded configuration/snapshots pass over framed
+descriptors. The child retains only inspection capabilities, plus NET_ADMIN when
+optional Docker discovery is enabled to read host conntrack. The HTTP/monitor
+parent clears SYS_PTRACE/DAC_READ_SEARCH and ambient capabilities and sets
+no-new-privileges before creating runtime threads; it retains capture/enforcement
+capabilities including NET_ADMIN. Bounded configuration/snapshots pass over framed
 stdin/stdout pipes. No host service, second container, shell supervisor, additional
 listening port, or separate binary is needed.
 
@@ -110,15 +112,52 @@ volumes:
 Set `docker_socket = "/var/run/docker.sock"` in `[applications]`, with discovery
 enabled. The collector issues only discovery GETs for API version and running
 containers. Each scan refreshes the full list, mapping TCP/UDP host/private ports
-and known container addresses with exposed ports. IDs identify container lifetimes;
+and known container addresses with exposed ports. It also collects container
+addresses independently of published/exposed ports and joins them with a bounded
+host NETLINK_NETFILTER conntrack dump. IDs identify container lifetimes;
 names and Compose service labels are display metadata. Discovery has a three-second
 timeout and 4 MiB response cap. Failed refreshes do not keep obsolete mappings current.
 
 Socket access grants Docker daemon API access even with `:ro`; this is an explicit
 opt-in. This release supports Unix endpoints. Without Docker API access, process
 discovery and configured labels work, but automatic friendly container names and
-published-port mappings are unavailable. Arbitrary DNAT/conntrack and other
-container runtimes are not resolved.
+published-port/NAT mappings are unavailable. Other container runtimes are not
+resolved.
+
+### Outbound container traffic and kernel WireGuard
+
+The same Docker socket opt-in enables NAT attribution automatically; no `conntrack`
+CLI package or extra container is required. The collector retains the existing
+NET_ADMIN capability for read-only host conntrack dumps. SYS_ADMIN and entering
+container network namespaces are not required.
+
+For an outgoing flow such as `172.30.0.2:57034 → 152.233.20.208:1194`, Docker may
+translate the source to `192.168.2.30:57034`. Einblick observes incoming replies to
+that host address before reverse NAT. The collector joins the conntrack reply
+with the original container address, then resolves it against Docker's current
+address inventory. The row displays the container name (for example,
+`arr-stack-gluetun-1`) with **Docker container via NAT** evidence (`nat_container`).
+No published port, process PID, or userspace socket owner is needed, so this also
+covers kernel WireGuard transports. It identifies a container/network endpoint;
+it does not establish which process or application inside a shared network
+namespace generated traffic, or label a protocol from its conventional port.
+Encrypted VPN traffic remains attributed to the tunnel's container; identifying
+applications carried inside it needs observation after decryption.
+
+Both original and reply directions are supported for translated TCP/UDP endpoints,
+including changed ports and IPv6. Matching requires the complete observed tuple,
+including a sampled source port. Flows from nonzero conntrack zones are excluded
+because capture records do not contain zone identity. Short-lived flows can be
+missed between scans; stale/future mappings never relabel earlier traffic.
+
+Health reports `nat_mappings`, and failures report `nat_unavailable` with a
+conntrack diagnostic. Each dump caps traversal at 65,536 flows and one second,
+with at most 4,096 container flow mappings per snapshot. Saturation reports
+`scan_limit`; failed dumps discard their partial mappings. Evidence is indexed
+and read from snapshots on the polling path, with no Docker or netlink I/O there.
+Rebuild the image and recreate the service after enabling the Docker socket.
+Earlier unknown history remains unchanged; new traffic can add container evidence
+to the same destination group.
 
 ## Configured labels
 

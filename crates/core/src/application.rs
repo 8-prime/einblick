@@ -9,6 +9,7 @@ pub const APPLICATION_BYTE_LIMIT: usize = 4096;
 pub enum ApplicationMethod {
     SocketOwner,
     PublishedPort,
+    NatContainer,
     Configured,
 }
 
@@ -37,6 +38,7 @@ pub enum ApplicationReason {
     PermissionDenied,
     ScanLimit,
     DockerUnavailable,
+    NatUnavailable,
     NoMatchingSocket,
     UnsupportedTransport,
     MultipleCandidates,
@@ -142,6 +144,8 @@ pub struct ApplicationHealth {
     pub sockets: usize,
     #[serde(default)]
     pub owned_sockets: usize,
+    #[serde(default)]
+    pub nat_mappings: usize,
     #[serde(default)]
     pub diagnostics: Vec<String>,
     pub reasons: Vec<ApplicationReason>,

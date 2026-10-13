@@ -1,6 +1,7 @@
 //! Optional application discovery. The child scans host state; the monitor only
 //! reads bounded, immutable snapshots and never performs proc or Docker I/O.
 mod docker;
+mod nat;
 mod sockets;
 
 use anyhow::{Context, Result, ensure};
@@ -58,6 +59,21 @@ struct PublishedEndpoint {
     application: ApplicationEvidence,
 }
 
+pub(super) struct ContainerAddress {
+    address: IpAddr,
+    application: ApplicationEvidence,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct NatEndpoint {
+    source: IpAddr,
+    destination: IpAddr,
+    source_port: u16,
+    port: u16,
+    protocol: u8,
+    application: ApplicationEvidence,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Inventory {
     observed_at: i64,
@@ -69,10 +85,14 @@ struct Inventory {
     local_addresses: Vec<IpAddr>,
     sockets: Vec<Endpoint>,
     published: Vec<PublishedEndpoint>,
+    #[serde(default)]
+    nat: Vec<NatEndpoint>,
     #[serde(skip)]
     socket_index: BTreeMap<(u8, u16), Vec<usize>>,
     #[serde(skip)]
     published_index: BTreeMap<(u8, u16), Vec<usize>>,
+    #[serde(skip)]
+    nat_index: BTreeMap<(u8, u16, IpAddr, IpAddr), Vec<usize>>,
     #[serde(skip)]
     local_set: BTreeSet<IpAddr>,
 }
@@ -125,6 +145,7 @@ impl Reader {
                 .iter()
                 .filter(|s| !s.owners.is_empty())
                 .count();
+            health.nat_mappings = inventory.nat.len();
             health.diagnostics = inventory.diagnostics.clone();
             health.reasons = inventory.reasons.clone();
             health.state = if inventory.available {
@@ -248,6 +269,23 @@ impl Reader {
                                 attribution.add(owner.clone());
                             }
                         }
+                    }
+                }
+                for index in inventory
+                    .nat_index
+                    .get(&(row.protocol, port, row.source, row.destination))
+                    .into_iter()
+                    .flatten()
+                {
+                    let endpoint = &inventory.nat[*index];
+                    // Require the complete observed flow, including the sampled
+                    // peer port. A host port alone can belong to many NAT flows.
+                    if row.source_ports.contains(&endpoint.source_port)
+                        && endpoint.application.observed_from <= row.last_seen
+                        && endpoint.application.observed_to + self.config.stale_seconds as i64
+                            >= row.first_seen
+                    {
+                        attribution.add(endpoint.application.clone());
                     }
                 }
                 for index in inventory
@@ -450,9 +488,14 @@ pub fn run_child(parent: u32) -> Result<()> {
         unsafe { libc::getppid() } as u32 == parent,
         "collector parent exited"
     );
-    retain_inspection_capabilities()?;
+    // Narrow inherited privileges before blocking on the configuration pipe.
+    // NET_ADMIN can then be removed permanently when Docker is not enabled.
+    retain_inspection_capabilities(true)?;
     let config: ApplicationConfig = serde_json::from_slice(&read_frame(&mut std::io::stdin())?)?;
     config.validate()?;
+    if config.docker_socket.is_empty() {
+        retain_inspection_capabilities(false)?;
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -462,8 +505,28 @@ pub fn run_child(parent: u32) -> Result<()> {
         let mut inventory = discover(&config);
         if !config.docker_socket.is_empty() {
             match runtime.block_on(docker::discover(&config.docker_socket)) {
-                Ok(published) => inventory.published = published,
-                Err(_) => inventory.reasons.push(ApplicationReason::DockerUnavailable),
+                Ok(discovery) => {
+                    // Docker/NAT evidence remains usable when host proc/socket
+                    // inspection fails; failure reasons still disclose that gap.
+                    inventory.available = true;
+                    inventory.published = discovery.published;
+                    match nat::discover(&discovery.addresses) {
+                        Ok((mappings, limited)) => {
+                            inventory.nat = mappings;
+                            if limited {
+                                inventory.reasons.push(ApplicationReason::ScanLimit);
+                            }
+                        }
+                        Err(error) => {
+                            inventory.reasons.push(ApplicationReason::NatUnavailable);
+                            inventory.diagnostic(format!("Host conntrack scan: {error:#}"));
+                        }
+                    }
+                }
+                Err(error) => {
+                    inventory.reasons.push(ApplicationReason::DockerUnavailable);
+                    inventory.diagnostic(format!("Docker discovery: {error:#}"));
+                }
             }
         }
         if let Err(error) = inventory.validate() {
@@ -482,7 +545,11 @@ pub fn run_child(parent: u32) -> Result<()> {
             if !inventory.reasons.contains(&ApplicationReason::ScanLimit) {
                 inventory.reasons.push(ApplicationReason::ScanLimit);
             }
-            if inventory.sockets.len() > inventory.published.len() {
+            if inventory.nat.len() >= inventory.sockets.len()
+                && inventory.nat.len() >= inventory.published.len()
+            {
+                inventory.nat.truncate(inventory.nat.len() / 2);
+            } else if inventory.sockets.len() > inventory.published.len() {
                 inventory.sockets.truncate(inventory.sockets.len() / 2);
             } else {
                 inventory.published.truncate(inventory.published.len() / 2);
@@ -524,6 +591,7 @@ impl Inventory {
     fn index(&mut self) {
         self.socket_index.clear();
         self.published_index.clear();
+        self.nat_index.clear();
         for (index, endpoint) in self.sockets.iter().enumerate() {
             self.socket_index
                 .entry((endpoint.protocol, endpoint.port))
@@ -536,14 +604,26 @@ impl Inventory {
                 .or_default()
                 .push(index);
         }
+        for (index, endpoint) in self.nat.iter().enumerate() {
+            self.nat_index
+                .entry((
+                    endpoint.protocol,
+                    endpoint.port,
+                    endpoint.source,
+                    endpoint.destination,
+                ))
+                .or_default()
+                .push(index);
+        }
         self.local_set = self.local_addresses.iter().copied().collect();
     }
     fn validate(&self) -> Result<()> {
         ensure!(
             self.sockets.len() <= SOCKET_LIMIT
                 && self.published.len() <= SOCKET_LIMIT
+                && self.nat.len() <= SOCKET_LIMIT
                 && self.local_addresses.len() <= LOCAL_ADDRESS_LIMIT
-                && self.reasons.len() <= 14
+                && self.reasons.len() <= 15
                 && self.diagnostics.len() <= 8
                 && self
                     .diagnostics
@@ -562,6 +642,15 @@ impl Inventory {
             }
         }
         for endpoint in &self.published {
+            validate_evidence(&endpoint.application)?;
+        }
+        for endpoint in &self.nat {
+            ensure!(
+                matches!(endpoint.protocol, 6 | 17)
+                    && endpoint.port != 0
+                    && endpoint.source_port != 0,
+                "invalid NAT flow metadata"
+            );
             validate_evidence(&endpoint.application)?;
         }
         Ok(())
@@ -813,7 +902,7 @@ struct CapabilityData {
     inheritable: u32,
 }
 
-fn capabilities(only_inspection: bool) -> Result<()> {
+fn capabilities(only_inspection: bool, nat_discovery: bool) -> Result<()> {
     const INSPECTION: u64 = (1 << 19) | (1 << 2); // CAP_SYS_PTRACE, CAP_DAC_READ_SEARCH
     let mut header = CapabilityHeader {
         version: 0x20080522,
@@ -828,7 +917,18 @@ fn capabilities(only_inspection: bool) -> Result<()> {
     );
     for (index, data) in data.iter_mut().enumerate() {
         let mask = (INSPECTION >> (index * 32)) as u32;
-        let keep = if only_inspection { mask } else { !mask };
+        // NET_ADMIN is already needed by the capture parent. The discovery
+        // child keeps it only for opt-in, read-only conntrack dumps; it never
+        // enters other namespaces or receives SYS_ADMIN.
+        let keep = if only_inspection {
+            mask | if nat_discovery && index == 0 {
+                1 << 12
+            } else {
+                0
+            }
+        } else {
+            !mask
+        };
         data.effective &= keep;
         data.permitted &= keep;
         data.inheritable &= keep;
@@ -859,10 +959,10 @@ fn capabilities(only_inspection: bool) -> Result<()> {
 }
 
 pub fn drop_inspection_capabilities() -> Result<()> {
-    capabilities(false)
+    capabilities(false, false)
 }
-fn retain_inspection_capabilities() -> Result<()> {
-    capabilities(true)
+fn retain_inspection_capabilities(nat_discovery: bool) -> Result<()> {
+    capabilities(true, nat_discovery)
 }
 
 #[cfg(test)]
@@ -920,6 +1020,122 @@ mod tests {
                 ..ApplicationConfig::default()
             },
         }
+    }
+
+    fn gluetun_mapping() -> NatEndpoint {
+        let mut application = owner("arr-stack-gluetun-1", 1);
+        application.id = format!("docker:{}", "a".repeat(64));
+        application.method = ApplicationMethod::NatContainer;
+        application.pid = None;
+        application.process_start = None;
+        application.container_id = Some("a".repeat(64));
+        application.service = Some("gluetun".into());
+        NatEndpoint {
+            source: "152.233.20.208".parse().unwrap(),
+            destination: "192.168.2.30".parse().unwrap(),
+            source_port: 1194,
+            port: 57034,
+            protocol: 17,
+            application,
+        }
+    }
+
+    #[test]
+    fn nat_container_enriches_kernel_tunnel_without_host_socket_and_preserves_counters() {
+        let mapping = gluetun_mapping();
+        let reader = reader(Inventory {
+            nat: vec![mapping.clone()],
+            ..Inventory::default()
+        });
+        let mut row = traffic("192.168.2.30", 57034);
+        row.source = mapping.source;
+        row.source_ports = vec![1194];
+        row.protocol = 17;
+        row.counts = TrafficCounts {
+            packets: 10,
+            bytes: 14000,
+            passed: 9,
+            dropped: 1,
+            syns: 2,
+            syn_acks: 3,
+            resets: 4,
+        };
+        let counts = serde_json::to_value(&row.counts).unwrap();
+        reader.enrich(&mut row);
+        assert_eq!(row.application_attribution.applications.len(), 1);
+        let application = &row.application_attribution.applications[0];
+        assert_eq!(application.name, "arr-stack-gluetun-1");
+        assert_eq!(application.method, ApplicationMethod::NatContainer);
+        assert!(application.pid.is_none());
+        assert!(row.application_attribution.reasons.is_empty());
+        assert_eq!(serde_json::to_value(&row.counts).unwrap(), counts);
+        let health = reader.health();
+        assert_eq!(health.nat_mappings, 1);
+        assert_eq!(health.sockets, 0);
+        assert_eq!(health.owned_sockets, 0);
+    }
+
+    #[test]
+    fn nat_mapping_requires_the_whole_flow_and_contemporaneous_evidence() {
+        let mapping = gluetun_mapping();
+        let mut base = traffic("192.168.2.30", 57034);
+        base.source = mapping.source;
+        base.source_ports = vec![1194];
+        base.protocol = 17;
+        for mismatch in 0..8 {
+            let mut row = base.clone();
+            let mut endpoint = mapping.clone();
+            match mismatch {
+                0 => row.source = "198.51.100.20".parse().unwrap(),
+                1 => row.destination = "192.168.2.31".parse().unwrap(),
+                2 => row.source_ports = vec![443],
+                3 => row.source_ports.clear(),
+                4 => row.protocol = 6,
+                5 => row.port = Some(57035),
+                6 => {
+                    endpoint.application.observed_from = 102;
+                    endpoint.application.observed_to = 102;
+                }
+                7 => {
+                    endpoint.application.observed_from = 1;
+                    endpoint.application.observed_to = 1;
+                }
+                _ => unreachable!(),
+            }
+            reader(Inventory {
+                nat: vec![endpoint],
+                ..Inventory::default()
+            })
+            .enrich(&mut row);
+            assert!(
+                row.application_attribution.applications.is_empty(),
+                "mismatch {mismatch}"
+            );
+            assert!(
+                row.application_attribution
+                    .reasons
+                    .contains(&ApplicationReason::NoMatchingSocket)
+            );
+        }
+    }
+
+    #[test]
+    fn nat_snapshot_round_trip_keeps_container_identity_and_rebuilds_flow_index() {
+        let inventory = Inventory {
+            nat: vec![gluetun_mapping()],
+            ..Inventory::default()
+        };
+        let bytes = serde_json::to_vec(&inventory).unwrap();
+        let mut decoded: Inventory = serde_json::from_slice(&bytes).unwrap();
+        decoded.validate().unwrap();
+        decoded.index();
+        assert_eq!(decoded.nat_index.len(), 1);
+        assert_eq!(
+            decoded.nat[0].application.method,
+            ApplicationMethod::NatContainer
+        );
+        decoded.nat[0].source_port = 0;
+        assert!(decoded.validate().is_err());
     }
 
     #[test]

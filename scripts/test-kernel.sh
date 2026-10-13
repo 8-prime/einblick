@@ -33,6 +33,10 @@ setpriv --bounding-set=-all,+bpf,+net_admin,+perfmon,+net_raw -- \
   "$test_binary" --exact backend::kernel_tests::xdp_namespace_rules_and_counters --ignored --nocapture
 EINBLICK_TEST_GENERIC=1 setpriv --bounding-set=-all,+bpf,+net_admin,+perfmon,+net_raw -- \
   "$test_binary" --exact backend::kernel_tests::xdp_namespace_rules_and_counters --ignored --nocapture
+# Exercise the real read-only conntrack dump against a controlled UDP SNAT flow,
+# including a translated source port and container evidence without a PID.
+setpriv --bounding-set=-all,+net_admin -- \
+  "$test_binary" --exact applications::nat::tests::real_kernel_snat_reply_maps_to_container_with_changed_host_port --ignored --nocapture
 # Verify crash cleanup with a real server process and an unpinned XDP link.
 dir=$(mktemp -d)
 trap 'if [[ -n ${pid:-} ]]; then kill "$pid" 2>/dev/null || true; fi; rm -rf "$dir"' EXIT

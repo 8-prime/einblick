@@ -105,7 +105,7 @@ Partial buckets, gaps, expiry, caps, and pre-deployment history are disclosed.
 
 Rows additionally include `application_attribution: { applications: [...], reasons: [...] }`.
 Each application contains `id`, `name`, `method` (`socket_owner`, `published_port`,
-or `configured`), nullable `pid`, `process_start`, `executable`, `service`,
+`nat_container`, or `configured`), nullable `pid`, `process_start`, `executable`, `service`,
 `container_id`, and `observed_from`/`observed_to` evidence time bounds. Rows retain
 at most eight candidates and 4 KiB serialized attribution. Exec/name changes and
 ownership changes are preserved; counters remain totals for the complete row.
@@ -115,7 +115,7 @@ evidence to an initially unknown group. Earlier missing-attribution reasons rema
 as partial-range history; they do not suppress new candidates.
 
 Reasons include `not_collected`, `disabled`, `waiting`, `collector_unavailable`,
-`stale`, `permission_denied`, `scan_limit`, `docker_unavailable`,
+`stale`, `permission_denied`, `scan_limit`, `docker_unavailable`, `nat_unavailable`,
 `no_matching_socket`, `unsupported_transport`, `multiple_candidates`, `truncated`,
 and `query_limit`. Multiple reasons may coexist with observed candidates. Unknown
 ownership does not prove a closed port or absent traffic. Old v2 rows are not
@@ -126,6 +126,11 @@ that limit prevents further application enrichment.
 `Snapshot.health.applications` includes automatic discovery `enabled`, `state`,
 nullable `last_scan`, discovered `sockets` count, `owned_sockets` (sockets with at
 least one identified owner), `reasons`, and bounded `diagnostics` strings.
+`nat_mappings` counts observed TCP/UDP flow mappings to Docker containers; these
+are container evidence and do not require a userspace socket owner. Conntrack
+errors report `nat_unavailable` and a bounded diagnostic. NAT evidence matches
+source/destination addresses, protocol, destination port, and an observed source
+port; the mapping never assigns a container from a shared host port alone.
 The `partial` state means scans produce evidence alongside discovery errors;
 individual socket-scan diagnostics identify IPv4/IPv6, TCP/UDP, and the OS error.
 Process-access diagnostics identify the inaccessible metadata stage. Attribution health
