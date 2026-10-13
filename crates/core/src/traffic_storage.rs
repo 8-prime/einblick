@@ -35,24 +35,39 @@ impl Database {
             let gap_from = batch.gap_from.into_iter().chain(restart_gap).min();
             if t.execute("INSERT OR IGNORE INTO traffic_batches VALUES(?,?,?)", params![batch.run,i64::try_from(batch.sequence)?,batch.to])? == 0 { return Ok(()); }
             t.execute("INSERT OR IGNORE INTO settings VALUES('traffic_started',?)", [batch.from.to_string()])?;
+            let mut application_collected=false;
             for (resolution, span) in [("minute",60),("hour",3600)] {
                 let at = batch.from / span * span;
                 for row in &batch.rows {
                     let port = row.port.map_or(-1, i32::from);
                     let mut merged = row.clone();
-                    let old: Option<(String,bool)> = t.query_row("SELECT source_ports,truncated FROM traffic WHERE resolution=? AND at=? AND source=? AND destination=? AND interface=? AND protocol=? AND port=?",
+                    let old: Option<(String,bool)> = t.prepare_cached("SELECT source_ports,truncated FROM traffic WHERE resolution=? AND at=? AND source=? AND destination=? AND interface=? AND protocol=? AND port=?")?.query_row(
                         params![resolution,at,row.source.to_string(),row.destination.to_string(),row.interface,row.protocol,port], |r| Ok((r.get(0)?,r.get(1)?))).optional()?;
+                    let previously_collected = old.is_some();
                     if let Some((ports,truncated)) = old {
                         let mut previous = row.clone(); previous.source_ports = serde_json::from_str(&ports)?; previous.source_ports_truncated = truncated;
                         merged.merge(&previous); // only the bounded sample is taken from this merge
                     }
-                    t.execute("INSERT INTO traffic VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(resolution,at,source,destination,interface,protocol,port) DO UPDATE SET
+                    t.prepare_cached("INSERT INTO traffic VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(resolution,at,source,destination,interface,protocol,port) DO UPDATE SET
                         packets=packets+excluded.packets,bytes=bytes+excluded.bytes,passed=passed+excluded.passed,dropped=dropped+excluded.dropped,
                         syns=syns+excluded.syns,syn_acks=syn_acks+excluded.syn_acks,resets=resets+excluded.resets,
-                        first_seen=min(first_seen,excluded.first_seen),last_seen=max(last_seen,excluded.last_seen),source_ports=excluded.source_ports,truncated=excluded.truncated",
+                        first_seen=min(first_seen,excluded.first_seen),last_seen=max(last_seen,excluded.last_seen),source_ports=excluded.source_ports,truncated=excluded.truncated")?.execute(
                         params![resolution,at,row.source.to_string(),row.destination.to_string(),row.interface,row.protocol,port,
                             i64::try_from(row.counts.packets)?,i64::try_from(row.counts.bytes)?,i64::try_from(row.counts.passed)?,i64::try_from(row.counts.dropped)?,i64::try_from(row.counts.syns)?,i64::try_from(row.counts.syn_acks)?,i64::try_from(row.counts.resets)?,
                             row.first_seen,row.last_seen,serde_json::to_string(&merged.source_ports)?,merged.source_ports_truncated])?;
+                    let old: Option<String> = t.prepare_cached("SELECT data FROM traffic_applications WHERE resolution=? AND at=? AND source=? AND destination=? AND interface=? AND protocol=? AND port=?")?.query_row(
+                        params![resolution,at,row.source.to_string(),row.destination.to_string(),row.interface,row.protocol,port], |r|r.get(0)).optional()?;
+                    let mut attribution=match old {
+                        Some(old)=>serde_json::from_str::<ApplicationAttribution>(&old)?,
+                        None if previously_collected=>ApplicationAttribution::default(),
+                        None=>ApplicationAttribution { applications:vec![],reasons:vec![] },
+                    };
+                    attribution.merge(&row.application_attribution);
+                    t.prepare_cached("INSERT INTO traffic_applications VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(resolution,at,source,destination,interface,protocol,port) DO UPDATE SET data=excluded.data")?.execute(
+                        params![resolution,at,row.source.to_string(),row.destination.to_string(),row.interface,row.protocol,port,serde_json::to_string(&attribution)?])?;
+                    if !attribution.applications.is_empty() || attribution.reasons.iter().any(|r|!matches!(r,ApplicationReason::NotCollected|ApplicationReason::Disabled)) {
+                        application_collected=true;
+                    }
                 }
                 t.execute("INSERT INTO traffic_coverage VALUES(?,?,?,?,?,?) ON CONFLICT(resolution,at) DO UPDATE SET complete=complete AND excluded.complete,
                     omitted=omitted+excluded.omitted,first_seen=min(first_seen,excluded.first_seen),last_seen=max(last_seen,excluded.last_seen)",
@@ -69,6 +84,7 @@ impl Database {
                     }
                 }
             }
+            if application_collected { t.execute("INSERT OR IGNORE INTO settings VALUES('application_attribution_started',?)",[batch.from.to_string()])?; }
             for (resolution,days) in [("minute",retention.minute_days),("hour",retention.hourly_days)] {
                 let cutoff = batch.to - days*86400;
                 t.execute("DELETE FROM traffic WHERE resolution=? AND at<?", params![resolution,cutoff])?;
@@ -119,8 +135,32 @@ impl Database {
                 let port: i32 = r.get(3)?;
                 let record = TrafficRecord {source:q.ip,destination:r.get::<_,String>(0)?.parse()?,interface:r.get(1)?,protocol:r.get(2)?,port:if port<0{None}else{Some(port as u16)},
                     counts:TrafficCounts{packets:r.get::<_,i64>(4)? as u64,bytes:r.get::<_,i64>(5)? as u64,passed:r.get::<_,i64>(6)? as u64,dropped:r.get::<_,i64>(7)? as u64,syns:r.get::<_,i64>(8)? as u64,syn_acks:r.get::<_,i64>(9)? as u64,resets:r.get::<_,i64>(10)? as u64},
-                    first_seen:r.get(11)?,last_seen:r.get(12)?,source_ports:serde_json::from_str(&r.get::<_,String>(13)?)?,source_ports_truncated:r.get(14)?};
+                    first_seen:r.get(11)?,last_seen:r.get(12)?,source_ports:serde_json::from_str(&r.get::<_,String>(13)?)?,source_ports_truncated:r.get(14)?,application_attribution:ApplicationAttribution{applications:vec![],reasons:vec![]}};
                 found.insert(record.cursor(),record);
+            }
+            // Read only selected associations, streaming and bounding enrichment work.
+            // LEFT JOIN retains explicit "not collected" evidence for pre-v3 history.
+            let mut attribution_bytes = 0;
+            let mut attribution_rows = 0;
+            let mut app_statement = t.prepare("SELECT a.data FROM traffic t LEFT JOIN traffic_applications a USING(resolution,at,source,destination,interface,protocol,port)
+                WHERE t.source=? AND t.resolution=? AND t.at>=? AND t.at<=? AND t.destination=? AND t.interface=? AND t.protocol=? AND t.port=? ORDER BY t.at LIMIT 10001")?;
+            for record in found.values_mut() {
+                if attribution_bytes >= 16*1024*1024 || attribution_rows >= 10000 {
+                    record.application_attribution.reason(ApplicationReason::QueryLimit);
+                    continue;
+                }
+                let mut apps = app_statement.query(params![q.ip.to_string(),q.resolution,from,to,record.destination.to_string(),record.interface,record.protocol,record.port.map_or(-1,i32::from)])?;
+                while let Some(r) = apps.next()? {
+                    let data: Option<String> = r.get(0)?;
+                    attribution_rows += 1;
+                    attribution_bytes += data.as_ref().map_or(0,|s|s.len());
+                    if attribution_bytes > 16*1024*1024 || attribution_rows > 10000 {
+                        record.application_attribution.reason(ApplicationReason::QueryLimit);
+                        break;
+                    }
+                    let attribution = data.map(|s|serde_json::from_str::<ApplicationAttribution>(&s)).transpose()?.unwrap_or_default();
+                    record.application_attribution.merge(&attribution);
+                }
             }
             let (available_from,available_to,n,healthy,omitted):(Option<i64>,Option<i64>,usize,bool,u64) = t.query_row(
                 "SELECT min(at),max(at),count(*),coalesce(min(complete),0),coalesce(sum(omitted),0) FROM traffic_coverage WHERE resolution=? AND at>=? AND at<=?",
@@ -128,6 +168,7 @@ impl Database {
             let retained_from: Option<i64> = t.query_row("SELECT min(at) FROM traffic_coverage WHERE resolution=?",[&q.resolution],|r|r.get(0))?;
             let stored_start: Option<i64> = t.query_row("SELECT CAST(value AS INTEGER) FROM settings WHERE key='traffic_started'",[],|r|r.get(0)).optional()?;
             let capture_started=stored_start.or_else(||live.batches.iter().map(|b|b.from).min());
+            let mut attribution_started: Option<i64> = t.query_row("SELECT CAST(value AS INTEGER) FROM settings WHERE key='application_attribution_started'",[],|r|r.get(0)).optional()?;
             let floor: Option<i64> = t.query_row("SELECT CAST(value AS INTEGER) FROM settings WHERE key=?",[format!("traffic_{}_floor",q.resolution)],|r|r.get(0)).optional()?;
             let stored_rows = t.query_row("SELECT count(*) FROM traffic",[],|r|Ok(r.get::<_,i64>(0)? as usize))?;
             let mut complete = healthy;
@@ -148,6 +189,9 @@ impl Database {
                 complete &= batch.complete;
                 omitted += batch.omitted;
                 for record in batch.rows.into_iter().filter(|r|r.source==q.ip && q.protocol.is_none_or(|p|p==r.protocol) && q.port.is_none_or(|p|Some(p)==r.port) && r.cursor()>cursor) {
+                    if !record.application_attribution.applications.is_empty() || record.application_attribution.reasons.iter().any(|r|!matches!(r,ApplicationReason::Disabled|ApplicationReason::NotCollected)) {
+                        attribution_started = Some(attribution_started.unwrap_or(batch.from).min(batch.from));
+                    }
                     found.entry(record.cursor()).and_modify(|old:&mut TrafficRecord|old.merge(&record)).or_insert(record);
                 }
             }
@@ -166,9 +210,17 @@ impl Database {
             let has_more = found.len()>q.limit;
             let mut out:Vec<_> = found.into_values().take(q.limit+1).collect();
             out.truncate(q.limit);
-            // Each record is bounded; 500 records stay comfortably below 4 MiB.
-            let next_cursor = if has_more {out.last().map(|r|serde_json::to_string(&r.cursor())).transpose()?}else{None};
-            Ok(TrafficPage{rows:out,next_cursor,capture_started,available_from:retained_from.or(available_from),available_to:available_to.map(|at|at+span),complete,omitted,stored_rows,warnings})
+            let mut response_bytes=0;
+            let mut keep=0;
+            for row in &out {
+                response_bytes+=serde_json::to_vec(row)?.len();
+                if response_bytes>4*1024*1024-16384 {break;}
+                keep+=1;
+            }
+            let response_limited=keep<out.len();out.truncate(keep);
+            let next_cursor = if has_more || response_limited {out.last().map(|r|serde_json::to_string(&r.cursor())).transpose()?}else{None};
+            if response_limited {warnings.push("Response size limit reached; load the next page.".into());}
+            Ok(TrafficPage{rows:out,next_cursor,capture_started,attribution_started,available_from:retained_from.or(available_from),available_to:available_to.map(|at|at+span),complete,omitted,stored_rows,warnings})
         }).await
     }
 }
@@ -196,6 +248,7 @@ mod tests {
             last_seen: 129,
             source_ports: vec![51000],
             source_ports_truncated: false,
+            application_attribution: ApplicationAttribution::default(),
         }
     }
     fn batch(sequence: u64, rows: Vec<TrafficRecord>) -> DetailBatch {
@@ -221,6 +274,246 @@ mod tests {
             cursor: None,
             limit: 100,
         }
+    }
+    fn attributed(name: &str, pid: u32) -> TrafficRecord {
+        let mut row = record("192.0.2.10", Some(443));
+        row.application_attribution = ApplicationAttribution {
+            applications: vec![],
+            reasons: vec![],
+        };
+        row.application_attribution.add(ApplicationEvidence {
+            id: format!("process:{pid}:123"),
+            name: name.into(),
+            method: ApplicationMethod::SocketOwner,
+            pid: Some(pid),
+            process_start: Some(123),
+            executable: None,
+            service: None,
+            container_id: None,
+            observed_from: 120,
+            observed_to: 129,
+        });
+        row
+    }
+
+    #[tokio::test]
+    async fn application_history_preserves_port_reassignment_and_retry_identity() {
+        let db = Database::open(":memory:").unwrap();
+        let first = batch(1, vec![attributed("nginx", 10)]);
+        db.detail_checkpoint(first.clone(), config::Retention::default(), 1000)
+            .await
+            .unwrap();
+        db.detail_checkpoint(first.clone(), config::Retention::default(), 1000)
+            .await
+            .unwrap();
+        let second = batch(2, vec![attributed("caddy", 11)]);
+        let live = LiveTraffic {
+            batches: vec![first, second.clone()],
+        };
+        let before = db.source_traffic(query("192.0.2.10"), live).await.unwrap();
+        assert_eq!(before.rows[0].counts.packets, 6);
+        assert_eq!(before.rows[0].application_attribution.applications.len(), 2);
+        db.detail_checkpoint(second, config::Retention::default(), 1000)
+            .await
+            .unwrap();
+        let after = db
+            .source_traffic(query("192.0.2.10"), LiveTraffic::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            after.rows[0].application_attribution,
+            before.rows[0].application_attribution
+        );
+        assert_eq!(after.rows[0].counts.packets, 6);
+        assert_eq!(after.attribution_started, Some(120));
+        let mut hour = query("192.0.2.10");
+        hour.resolution = "hour".into();
+        let rolled = db
+            .source_traffic(hour, LiveTraffic::default())
+            .await
+            .unwrap();
+        assert_eq!(rolled.rows[0].application_attribution.applications.len(), 2);
+        assert_eq!(rolled.rows[0].counts.packets, 6);
+    }
+
+    #[tokio::test]
+    async fn saturated_application_sets_are_consistent_before_and_after_commit() {
+        let db = Database::open(":memory:").unwrap();
+        let mut row = attributed("worker-10", 10);
+        for pid in 11..18 {
+            row.application_attribution.add(
+                attributed(&format!("worker-{pid}"), pid)
+                    .application_attribution
+                    .applications
+                    .remove(0),
+            );
+        }
+        db.detail_checkpoint(batch(1, vec![row]), config::Retention::default(), 1000)
+            .await
+            .unwrap();
+        let second = batch(2, vec![attributed("new-worker", 99)]);
+        let before = db
+            .source_traffic(
+                query("192.0.2.10"),
+                LiveTraffic {
+                    batches: vec![second.clone()],
+                },
+            )
+            .await
+            .unwrap();
+        db.detail_checkpoint(second, config::Retention::default(), 1000)
+            .await
+            .unwrap();
+        let after = db
+            .source_traffic(query("192.0.2.10"), LiveTraffic::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            before.rows[0].application_attribution,
+            after.rows[0].application_attribution
+        );
+        assert_eq!(after.rows[0].counts.packets, 6);
+        assert!(
+            after.rows[0]
+                .application_attribution
+                .reasons
+                .contains(&ApplicationReason::Truncated)
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_evidence_stays_unknown_and_sidecars_follow_bucket_pruning() {
+        let db = Database::open(":memory:").unwrap();
+        db.detail_checkpoint(
+            batch(1, vec![record("192.0.2.10", Some(443))]),
+            config::Retention::default(),
+            1000,
+        )
+        .await
+        .unwrap();
+        // Simulate a migrated v2 traffic bucket with no attribution sidecar.
+        db.call(|c| {
+            c.execute("DELETE FROM traffic_applications", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        db.detail_checkpoint(
+            batch(2, vec![attributed("nginx", 10)]),
+            config::Retention::default(),
+            1000,
+        )
+        .await
+        .unwrap();
+        let page = db
+            .source_traffic(query("192.0.2.10"), LiveTraffic::default())
+            .await
+            .unwrap();
+        assert!(
+            page.rows[0]
+                .application_attribution
+                .reasons
+                .contains(&ApplicationReason::NotCollected)
+        );
+        assert_eq!(page.rows[0].counts.packets, 6);
+        let mut later = batch(3, vec![attributed("caddy", 11)]);
+        later.from = 180;
+        later.to = 190;
+        db.detail_checkpoint(later, config::Retention::default(), 1)
+            .await
+            .unwrap();
+        let orphan_count=db.read(|c|Ok(c.query_row("SELECT count(*) FROM traffic_applications a LEFT JOIN traffic t USING(resolution,at,source,destination,interface,protocol,port) WHERE t.source IS NULL",[],|r|r.get::<_,i64>(0))?)).await.unwrap();
+        assert_eq!(orphan_count, 0);
+    }
+
+    #[tokio::test]
+    async fn version_two_upgrade_backs_up_and_retains_unknown_application_history() {
+        let path = std::env::temp_dir().join(format!(
+            "einblick-application-migration-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let name = path.to_str().unwrap();
+        let old = Database::open(name).unwrap();
+        old.detail_checkpoint(
+            batch(1, vec![record("192.0.2.10", Some(443))]),
+            config::Retention::default(),
+            1000,
+        )
+        .await
+        .unwrap();
+        old.call(|c| { c.execute_batch("DROP TABLE traffic_applications;DROP INDEX traffic_application_lookup;PRAGMA user_version=2;")?;Ok(()) }).await.unwrap();
+        drop(old);
+        let upgraded = Database::open(name).unwrap();
+        let page = upgraded
+            .source_traffic(query("192.0.2.10"), LiveTraffic::default())
+            .await
+            .unwrap();
+        assert_eq!(page.rows[0].counts.packets, 3);
+        assert_eq!(
+            page.rows[0].application_attribution,
+            ApplicationAttribution::default()
+        );
+        assert_eq!(page.attribution_started, None);
+        let backup = rusqlite::Connection::open(format!("{name}.schema-v2-backup")).unwrap();
+        assert_eq!(
+            backup
+                .pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            backup
+                .query_row(
+                    "SELECT sum(packets) FROM traffic WHERE resolution='minute'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            3
+        );
+        drop(backup);
+        drop(upgraded);
+        for suffix in ["", "-wal", "-shm", ".schema-v2-backup"] {
+            let _ = std::fs::remove_file(format!("{name}{suffix}"));
+        }
+    }
+
+    #[tokio::test]
+    async fn historical_enrichment_limit_does_not_truncate_traffic_counts() {
+        let db = Database::open(":memory:").unwrap();
+        db.detail_checkpoint(
+            batch(1, vec![attributed("nginx", 10)]),
+            config::Retention::default(),
+            100000,
+        )
+        .await
+        .unwrap();
+        db.call(|c| {
+            c.execute_batch("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<10000)
+                INSERT INTO traffic SELECT resolution,at+i*60,source,destination,interface,protocol,port,packets,bytes,passed,dropped,syns,syn_acks,resets,first_seen+i*60,last_seen+i*60,source_ports,truncated
+                FROM traffic,n WHERE resolution='minute' AND at=120;")?;
+            Ok(())
+        }).await.unwrap();
+        let mut q = query("192.0.2.10");
+        q.to = 600130;
+        let page = db.source_traffic(q, LiveTraffic::default()).await.unwrap();
+        assert_eq!(page.rows[0].counts.packets, 30003);
+        assert!(
+            page.rows[0]
+                .application_attribution
+                .reasons
+                .contains(&ApplicationReason::QueryLimit)
+        );
+        assert!(
+            page.rows[0]
+                .application_attribution
+                .reasons
+                .contains(&ApplicationReason::NotCollected)
+        );
     }
     #[tokio::test]
     async fn associations_roll_up_idempotently_and_live_flush_does_not_duplicate() {
@@ -402,7 +695,11 @@ mod tests {
         ));
         let db = Database::open(path.to_str().unwrap()).unwrap();
         let rows = (0..16384)
-            .map(|port| record("192.0.2.10", Some(port)))
+            .map(|port| {
+                let mut row = attributed("web-service", 10);
+                row.port = Some(port);
+                row
+            })
             .collect();
         let started = std::time::Instant::now();
         db.detail_checkpoint(batch(1, rows), config::Retention::default(), 1_000_000)

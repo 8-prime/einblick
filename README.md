@@ -166,6 +166,16 @@ bounded source-port samples, and related detection events. Filters run before
 pagination. Unparsed ports are explicit; passing XDP does not mean a service
 accepted a connection.
 
+The detail table also shows local application/service candidates from recorded
+socket ownership, optional Docker mappings, or configured labels. Discovery runs
+as a child of the existing executable in the same image/container. Production
+Compose adds a host-proc mount and inspection capabilities, which the HTTP parent
+drops before creating runtime threads. Add `[applications] enabled = true` to an
+existing config; the example already enables it. Historical evidence preserves
+application changes on a port. Counts are not divided among candidates, and
+ownership does not prove delivery. See [application attribution](docs/APPLICATION_ATTRIBUTION.md)
+for deployment, Docker access, configured labels, coverage, and limits.
+
 IP detail includes low-volume sources outside the top-100 summary, within
 `association_capacity` (4,096 per bank) and `detail_minute_capacity` (16,384 distinct
 groups per minute). Detail uses the configured seven-day minute and 90-day hourly
@@ -181,11 +191,13 @@ checkpoint; the restart boundary is marked incomplete. Full queues retain gap
 metadata and omitted packet counts. Legacy aggregate history still checkpoints
 at minute boundaries and can lose an unfinished minute on abrupt exit.
 
-On the first schema-v1 upgrade, the SQLite backup API saves
-`<database>.schema-v1-backup`, then migrates transactionally to schema v2. Rules,
-settings, audit, and aggregate history remain. Rollback requires restoring this
-backup with the old image. Earlier IP-to-port associations cannot be reconstructed;
-capture starts with this deployment. Preserve the migration backup separately.
+Schema upgrades use SQLite's backup API before a transactional migration. A v1
+database saves `<database>.schema-v1-backup`; a v2 database saves
+`<database>.schema-v2-backup`. The current schema is v3. Rules, settings, audit,
+and existing history remain. Rollback restores the original backup with the
+matching old image. Earlier IP-to-port or application associations cannot be
+reconstructed; capture starts with their respective deployments. Preserve the
+migration backup separately.
 Use SQLite's online backup API or stop the service before copying the database;
 copying only the `.sqlite` file while WAL is active is insufficient.
 

@@ -97,6 +97,8 @@ impl Rule {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Health {
+    #[serde(default)]
+    pub applications: crate::ApplicationHealth,
     pub backend: String,
     pub attachments: Vec<String>,
     pub telemetry_complete: bool,

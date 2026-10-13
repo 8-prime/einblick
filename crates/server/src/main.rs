@@ -1,4 +1,5 @@
 mod api;
+mod applications;
 mod auth;
 mod backend;
 mod monitor;
@@ -7,15 +8,55 @@ use einblick_core::{Config, Snapshot, storage::Database};
 use std::{path::Path, sync::Arc};
 use tokio::sync::{RwLock, broadcast, mpsc};
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args
+        .first()
+        .is_some_and(|s| s == "--internal-application-collector")
+    {
+        let parent = args
+            .get(1)
+            .context("internal collector requires parent PID")?
+            .parse()?;
+        return applications::run_child(parent);
+    }
+    // Spawn the child and clear inspection capabilities before ANY runtime
+    // threads or administrator secret/database descriptors exist.
+    let config = if args.first().is_some_and(|s| s == "--healthcheck") {
+        None
+    } else {
+        let path = if args.first().is_some_and(|s| s == "--config") {
+            args.get(1).context("--config requires a path")?.as_str()
+        } else {
+            "einblick.toml"
+        };
+        Some(Config::load(Path::new(path))?)
+    };
+    let collector = config
+        .as_ref()
+        .map(|c| applications::Collector::start(&c.applications))
+        .transpose()?;
+    if config.is_none() {
+        applications::drop_inspection_capabilities()?;
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    runtime.block_on(run(args, config, collector))
+}
+
+async fn run(
+    args: Vec<String>,
+    config: Option<Config>,
+    collector: Option<applications::Collector>,
+) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "einblick=info".into()),
         )
         .init();
-    let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.first().is_some_and(|s| s == "--healthcheck") {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let bind = std::env::var("EINBLICK_HEALTH_ADDRESS").unwrap_or("127.0.0.1:9080".into());
@@ -31,12 +72,7 @@ async fn main() -> Result<()> {
         })
         .await?;
     }
-    let path = if args.first().is_some_and(|s| s == "--config") {
-        args.get(1).context("--config requires a path")?.as_str()
-    } else {
-        "einblick.toml"
-    };
-    let config = Config::load(Path::new(path))?;
+    let config = config.context("missing runtime configuration")?;
     let password = std::fs::read_to_string(&config.password_file)
         .context("read mounted administrator password secret")?;
     let auth = Arc::new(auth::Auth::new(password.trim_end())?);
@@ -46,13 +82,16 @@ async fn main() -> Result<()> {
     let (commands, rx) = mpsc::channel(16);
     let (updates, _) = broadcast::channel(4);
     let (stop, _) = broadcast::channel(1);
-    let monitor = monitor::Monitor::new(
+    let mut monitor = monitor::Monitor::new(
         config.clone(),
         db.clone(),
         snapshot.clone(),
         updates.clone(),
     )
     .await?;
+    if let Some(collector) = &collector {
+        monitor.applications = collector.reader.clone();
+    }
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .context("bind HTTP listener")?;

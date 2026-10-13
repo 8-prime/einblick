@@ -81,6 +81,7 @@ TCP/UDP header. Source ports are a sample; historical merging can return a small
 sample with truncation flagged. No payload or connection-success claim is included.
 
 Response fields: `rows`, optional `next_cursor`, optional `capture_started`,
+optional `attribution_started`,
 optional `available_from`/`available_to` (persisted bucket bounds), `complete`,
 `omitted` (packet-detail omissions across the queried buckets), `stored_rows`
 (global retained row count), and `warnings`. Coverage is collector-wide, because
@@ -92,6 +93,29 @@ prevent double counting. At most 500 bounded records remain below the 4 MiB
 response ceiling. Detail is separate from SSE snapshots; the selected dashboard
 view refreshes every five seconds and supports pagination and direct IP lookup.
 Partial buckets, gaps, expiry, caps, and pre-deployment history are disclosed.
+
+### Application evidence
+
+Rows additionally include `application_attribution: { applications: [...], reasons: [...] }`.
+Each application contains `id`, `name`, `method` (`socket_owner`, `published_port`,
+or `configured`), nullable `pid`, `process_start`, `executable`, `service`,
+`container_id`, and `observed_from`/`observed_to` evidence time bounds. Rows retain
+at most eight candidates and 4 KiB serialized attribution. Exec/name changes and
+ownership changes are preserved; counters remain totals for the complete row.
+
+Reasons include `not_collected`, `disabled`, `waiting`, `collector_unavailable`,
+`stale`, `permission_denied`, `scan_limit`, `docker_unavailable`,
+`no_matching_socket`, `unsupported_transport`, `multiple_candidates`, `truncated`,
+and `query_limit`. Multiple reasons may coexist with observed candidates. Unknown
+ownership does not prove a closed port or absent traffic. Old v2 rows are not
+backfilled from current processes. Historical enrichment is bounded to 10,000
+bucket records / 16 MiB of metadata per query; traffic counts stay complete when
+that limit prevents further application enrichment.
+
+`Snapshot.health.applications` includes automatic discovery `enabled`, `state`,
+nullable `last_scan`, discovered `sockets` count, and `reasons`. Attribution health
+is independent of traffic/detection completeness and `/healthz` readiness.
+See [application attribution](APPLICATION_ATTRIBUTION.md) for deployment and limits.
 
 `Rule`: `id`, `network`, `kind`, `reason`, `actor`, `created`, optional `expires`,
 `enabled`, `applied`, optional `error`. Timestamps are UTC Unix seconds. Expired or

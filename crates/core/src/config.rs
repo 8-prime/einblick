@@ -27,6 +27,44 @@ pub struct Config {
     pub management_allowlist: Vec<IpNet>,
     pub detection: Thresholds,
     pub retention: Retention,
+    pub applications: ApplicationConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ApplicationConfig {
+    pub enabled: bool,
+    pub proc_root: String,
+    pub refresh_seconds: u64,
+    pub stale_seconds: u64,
+    /// Empty disables Docker API access. Only Unix sockets are supported.
+    pub docker_socket: String,
+    pub batch_evidence_bytes: usize,
+    pub services: Vec<ServiceLabel>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServiceLabel {
+    pub name: String,
+    pub destination: IpNet,
+    pub protocol: u8,
+    pub port: u16,
+    pub interface: Option<String>,
+}
+
+impl Default for ApplicationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            proc_root: "/host/proc".into(),
+            refresh_seconds: 2,
+            stale_seconds: 10,
+            docker_socket: String::new(),
+            batch_evidence_bytes: 8 * 1024 * 1024,
+            services: vec![],
+        }
+    }
 }
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -87,6 +125,7 @@ impl Default for Config {
             management_allowlist: vec![],
             detection: Thresholds::default(),
             retention: Retention::default(),
+            applications: ApplicationConfig::default(),
         }
     }
 }
@@ -97,6 +136,7 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        self.applications.validate()?;
         ensure!(
             self.mock || !self.interfaces.is_empty(),
             "configure at least one interface, or use mock=true"
@@ -173,5 +213,53 @@ impl Config {
     }
     pub fn trusted(&self, ip: IpAddr) -> bool {
         self.trusted_proxies.iter().any(|n| n.contains(&ip))
+    }
+}
+
+impl ApplicationConfig {
+    pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=60).contains(&self.refresh_seconds)
+                && self.stale_seconds >= self.refresh_seconds * 2
+                && self.stale_seconds <= 120,
+            "invalid application refresh/expiry"
+        );
+        ensure!(
+            Path::new(&self.proc_root).is_absolute() && self.proc_root.len() <= 256,
+            "application proc_root must be an absolute path (at most 256 bytes)"
+        );
+        ensure!(
+            self.docker_socket.is_empty()
+                || (Path::new(&self.docker_socket).is_absolute() && self.docker_socket.len() < 108),
+            "application docker_socket must be an absolute Unix socket path"
+        );
+        ensure!(
+            self.services.len() <= 128,
+            "application service label capacity exceeded"
+        );
+        ensure!(
+            (262144..=32 * 1024 * 1024).contains(&self.batch_evidence_bytes),
+            "application batch_evidence_bytes must be between 256 KiB and 32 MiB"
+        );
+        for service in &self.services {
+            ensure!(
+                !service.name.is_empty()
+                    && service.name.len() <= crate::APPLICATION_TEXT_LIMIT
+                    && !service.name.chars().any(char::is_control),
+                "invalid application service name"
+            );
+            ensure!(
+                matches!(service.protocol, 6 | 17),
+                "service protocol must be TCP (6) or UDP (17)"
+            );
+            ensure!(
+                service
+                    .interface
+                    .as_ref()
+                    .is_none_or(|i| !i.is_empty() && i.len() < 16),
+                "invalid application service interface"
+            );
+        }
+        Ok(())
     }
 }

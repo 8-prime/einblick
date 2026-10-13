@@ -67,6 +67,8 @@ pub struct Monitor {
     detail_gap_from: Option<i64>,
     detail_storage_ok: bool,
     evidence_gap: bool,
+    pub applications: crate::applications::Reader,
+    application_bytes: usize,
 }
 impl Monitor {
     pub async fn new(
@@ -87,6 +89,7 @@ impl Monitor {
         }
         db.applied(rules.clone()).await?;
         let detector = Detector::new(config.detection.clone(), config.source_capacity as usize);
+        let applications = crate::applications::Reader::disabled(config.applications.clone());
         Ok(Self {
             config,
             db,
@@ -132,6 +135,8 @@ impl Monitor {
             detail_gap_from: None,
             detail_storage_ok: true,
             evidence_gap: false,
+            applications,
+            application_bytes: 0,
         })
     }
     pub async fn run(
@@ -497,7 +502,8 @@ impl Monitor {
         }
         self.detail_ok &= self.detail_complete;
         self.detail_omitted += rate.association_misses;
-        for row in o.traffic {
+        for mut row in o.traffic {
+            self.applications.enrich(&mut row);
             let key = row.key();
             if !self.detail_keys.contains(&key)
                 && self.detail_keys.len() >= self.config.detail_minute_capacity
@@ -508,10 +514,37 @@ impl Monitor {
                 continue;
             }
             self.detail_keys.insert(key.clone());
-            self.detail
-                .entry(key)
-                .and_modify(|old| old.merge(&row))
-                .or_insert(row);
+            let old = self.detail.get(&key).map(|r| &r.application_attribution);
+            let bytes = |a: &ApplicationAttribution| {
+                serde_json::to_vec(&a.applications).map_or(0, |v| v.len().saturating_sub(2))
+            };
+            let old_bytes = old.map_or(0, bytes);
+            let mut merged = old.cloned().unwrap_or(ApplicationAttribution {
+                applications: vec![],
+                reasons: vec![],
+            });
+            merged.merge(&row.application_attribution);
+            if self.application_bytes - old_bytes + bytes(&merged)
+                > self.config.applications.batch_evidence_bytes
+            {
+                // Keep previous evidence but omit new candidates; counts are
+                // still merged normally. Reserve base status bytes per row.
+                merged = old.cloned().unwrap_or(ApplicationAttribution {
+                    applications: vec![],
+                    reasons: vec![],
+                });
+                merged.merge(&ApplicationAttribution::unknown(
+                    ApplicationReason::Truncated,
+                ));
+            }
+            self.application_bytes = self.application_bytes - old_bytes + bytes(&merged);
+            if let Some(old) = self.detail.get_mut(&key) {
+                old.merge(&row);
+                old.application_attribution = merged;
+            } else {
+                row.application_attribution = merged;
+                self.detail.insert(key, row);
+            }
         }
         if !self.detail_complete && self.reasons.is_empty() {
             self.reasons
@@ -609,6 +642,7 @@ impl Monitor {
             automatic: self.automatic,
             blocking: self.blocking,
             health: Health {
+                applications: self.applications.health(),
                 backend,
                 attachments,
                 telemetry_complete: complete,
@@ -658,6 +692,7 @@ impl Monitor {
             self.detail_ok = false;
         }
         self.detail.clear();
+        self.application_bytes = 0;
         self.detail_sequence += 1;
         self.detail_from = now;
     }
@@ -818,6 +853,71 @@ mod tests {
         assert!(snapshot.health.detection_complete);
         assert!(!snapshot.health.detail_complete && !snapshot.health.telemetry_complete);
         assert!(m.rules.iter().any(|r| r.actor == "detector"));
+    }
+
+    #[tokio::test]
+    async fn missing_application_collector_does_not_degrade_detection_or_traffic() {
+        let mut m = monitor(true).await;
+        m.applications = crate::applications::Reader::disabled(config::ApplicationConfig {
+            enabled: true,
+            ..config::ApplicationConfig::default()
+        });
+        let o = m.backend.poll().unwrap();
+        m.process(unix_now(), 1.0, o).await;
+        let snapshot = m.snapshot.read().await;
+        assert!(snapshot.health.detection_complete && snapshot.health.detail_complete);
+        assert!(m.detail.values().all(|r| {
+            r.application_attribution
+                .reasons
+                .contains(&ApplicationReason::Waiting)
+        }));
+    }
+
+    #[tokio::test]
+    async fn application_budget_preserves_counts_and_recovers_after_checkpoint() {
+        let mut m = monitor(true).await;
+        m.config.applications.batch_evidence_bytes = 1; // force saturation in this regression
+        m.applications = crate::applications::Reader::disabled(config::ApplicationConfig {
+            services: vec![config::ServiceLabel {
+                name: "web".into(),
+                destination: "192.0.2.1/32".parse().unwrap(),
+                protocol: 6,
+                port: 443,
+                interface: None,
+            }],
+            ..config::ApplicationConfig::default()
+        });
+        let now = unix_now();
+        let o = m.backend.poll().unwrap();
+        let expected = o.traffic.iter().map(|r| r.counts.packets).sum::<u64>();
+        m.process(now, 1.0, o).await;
+        assert_eq!(
+            m.detail.values().map(|r| r.counts.packets).sum::<u64>(),
+            expected
+        );
+        assert!(m.detail.values().any(|r| {
+            r.application_attribution
+                .reasons
+                .contains(&ApplicationReason::Truncated)
+        }));
+        assert!(
+            m.detail
+                .values()
+                .all(|r| r.application_attribution.applications.is_empty())
+        );
+        let o = m.backend.poll().unwrap();
+        m.process(now + 1, 1.0, o).await;
+        assert_eq!(m.application_bytes, 0);
+        assert!(m.snapshot.read().await.health.detail_complete);
+        m.flush_detail(now + 2);
+        m.config.applications.batch_evidence_bytes = 8388608;
+        let o = m.backend.poll().unwrap();
+        m.process(now + 3, 1.0, o).await;
+        assert!(
+            m.detail
+                .values()
+                .any(|r| !r.application_attribution.applications.is_empty())
+        );
     }
     #[tokio::test]
     async fn source_map_loss_still_suspends_bans() {

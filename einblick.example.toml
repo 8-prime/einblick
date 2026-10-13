@@ -20,6 +20,23 @@ ring_bytes = 1048576
 # Protect your actual administrator / VPN address before enabling automatic bans.
 management_allowlist = []
 
+[applications]
+enabled = true
+proc_root = "/host/proc"
+refresh_seconds = 2
+stale_seconds = 10
+# Serialized application evidence beyond the per-row status allowance, per batch.
+batch_evidence_bytes = 8388608
+# Optional: mount the Docker daemon socket and set its path for automatic
+# container names / published ports. A :ro socket mount still grants API access.
+docker_socket = ""
+# Service labels also work without automatic discovery. Protocol 6=TCP, 17=UDP.
+# [[applications.services]]
+# name = "My web service"
+# destination = "192.0.2.1/32"
+# protocol = 6
+# port = 443
+
 [detection]
 scan_ports = 25
 syns_10s = 1000

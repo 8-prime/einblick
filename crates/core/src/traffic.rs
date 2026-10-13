@@ -35,6 +35,8 @@ pub struct TrafficRecord {
     pub last_seen: i64,
     pub source_ports: Vec<u16>,
     pub source_ports_truncated: bool,
+    #[serde(default)]
+    pub application_attribution: crate::ApplicationAttribution,
 }
 pub type TrafficKey = (IpAddr, IpAddr, String, u8, Option<u16>);
 pub type TrafficCursor = (String, String, u8, i32);
@@ -57,6 +59,8 @@ impl TrafficRecord {
         )
     }
     pub fn merge(&mut self, other: &Self) {
+        self.application_attribution
+            .merge(&other.application_attribution);
         self.counts.add(&other.counts);
         self.first_seen = self.first_seen.min(other.first_seen);
         self.last_seen = self.last_seen.max(other.last_seen);
@@ -138,6 +142,7 @@ pub struct TrafficPage {
     pub rows: Vec<TrafficRecord>,
     pub next_cursor: Option<String>,
     pub capture_started: Option<i64>,
+    pub attribution_started: Option<i64>,
     pub available_from: Option<i64>,
     pub available_to: Option<i64>,
     pub complete: bool,

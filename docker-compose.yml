@@ -7,7 +7,9 @@ services:
     restart: unless-stopped
     cap_drop: [ALL]
     # PERFMON permits the verifier's packet-pointer arithmetic on Linux 6.1+.
-    cap_add: [BPF, NET_ADMIN, PERFMON]
+    # Application collector reads host socket owners; the HTTP parent drops
+    # SYS_PTRACE/DAC_READ_SEARCH before starting runtime threads.
+    cap_add: [BPF, NET_ADMIN, PERFMON, SYS_PTRACE, DAC_READ_SEARCH]
     # Docker's default seccomp profile may reject bpf(); capabilities still apply.
     security_opt:
       - no-new-privileges:true
@@ -22,6 +24,7 @@ services:
     volumes:
       - einblick-data:/data
       - ./einblick.toml:/etc/einblick.toml:ro
+      - /proc:/host/proc:ro
     secrets:
       - source: admin-password
         target: admin-password

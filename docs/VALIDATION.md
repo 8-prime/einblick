@@ -1,5 +1,42 @@
 # Implementation validation — 2026-10-12
 
+## Application attribution — 2026-10-13
+
+- Same-image child collector exercised against real unprivileged TCP/UDP sockets
+  and proc metadata, including ownership and socket close. The actual child
+  executable/IPC integration test verifies capability masks and no-new-privileges.
+- Regression coverage includes specific/wildcard/local-versus-forwarded matching,
+  configured label precedence, Docker public/private ports and protocols, stale
+  and future evidence, child loss, bounded frames/text/candidate sets, exec/name
+  changes, attribution budget saturation/recovery, schema-v2 backup/data preservation,
+  idempotent minute/hour/live merges, pruning, and historical query saturation
+  without reducing packet counts. Detection/traffic health stay independent.
+- HTTP smoke test passed application labels and historical label changes,
+  parent capability checks, real child startup, SIGKILL/reaping, healthy traffic
+  after child loss, restart persistence, and existing auth/firewall/SSE checks.
+  The final debug smoke-test peak RSS was **37,012 KiB** for the server and
+  **12,836 KiB** for the child; input still has only three synthetic sources.
+- Rust formatting, workspace tests (**52 passed**), Clippy with warnings denied, Svelte check
+  (zero errors/warnings), and frontend production build passed. The privileged
+  XDP test remains excluded from the ordinary suite. XDP program/ABI were unchanged;
+  the privileged harness was not rerun in this session.
+- The file-backed debug resource check now includes one application per each of
+  **16,384 groups** (32,768 minute/hour traffic and matching attribution rows).
+  After caching checkpoint statements, one batch took **4.215 s**, a 500-row
+  query **79.43 ms**, and the response **253,597 bytes**. Allocated SQLite pages
+  were **17,510,400 bytes**, with **17,674,832 WAL bytes** after commit. This is a
+  synthetic batch, not a sustained throughput or maximum-capacity acceptance test.
+- Docker image build could not run because the local Docker daemon socket was
+  unavailable. No image deployment or production Linux 6.1/cross-user capability
+  validation was performed. Browser automation surfaces were unavailable; frontend
+  validation here comprises compiler/build and embedded HTTP checks.
+
+Runtime setup and supported coverage are in `APPLICATION_ATTRIBUTION.md`. Exact
+TCP-client flow attribution, arbitrary DNAT, and proxy upstream/log attribution
+remain future extensions. Rootful Docker permission/LSM profiles, Docker daemon
+integration on a live deployment, long-running process/port churn, and host
+CPU/RSS/disk performance remain deployment validation tasks.
+
 ## Port-bank reclamation and source traffic detail
 
 Current implementation checks (supersede the earlier verifier notes below):

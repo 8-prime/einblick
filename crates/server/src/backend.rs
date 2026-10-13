@@ -590,6 +590,7 @@ impl Kernel {
                 last_seen: 0,
                 source_ports: vec![],
                 source_ports_truncated: false,
+                application_attribution: einblick_core::ApplicationAttribution::default(),
             };
             for v in values.iter().filter(|v| v.packets > 0) {
                 let part = TrafficRecord {
@@ -711,6 +712,7 @@ impl Mock {
                 last_seen: now,
                 source_ports: vec![45000],
                 source_ports_truncated: false,
+                application_attribution: einblick_core::ApplicationAttribution::default(),
             });
             for _ in 0..syn {
                 syns.push((ip, port));

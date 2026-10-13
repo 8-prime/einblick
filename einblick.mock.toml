@@ -5,3 +5,15 @@ secure_cookies = false
 database = "data/mock.sqlite"
 password_file = "secrets/admin-password"
 management_allowlist = ["192.0.2.24/32"]
+
+[[applications.services]]
+name = "Demo HTTPS service"
+destination = "192.0.2.1/32"
+protocol = 6
+port = 443
+
+[[applications.services]]
+name = "Demo SSH service"
+destination = "2001:db8::1/128"
+protocol = 6
+port = 22
