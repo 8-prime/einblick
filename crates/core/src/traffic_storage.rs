@@ -337,6 +337,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_history_does_not_suppress_later_attribution() {
+        for legacy in [false, true] {
+            for later_from in [130, 180] {
+                let db = Database::open(":memory:").unwrap();
+                db.detail_checkpoint(
+                    batch(1, vec![record("192.0.2.10", Some(443))]),
+                    config::Retention::default(),
+                    1000,
+                )
+                .await
+                .unwrap();
+                if legacy {
+                    // Migrated history has traffic without an attribution sidecar.
+                    db.call(|c| {
+                        c.execute("DELETE FROM traffic_applications", [])?;
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                }
+                let original = db
+                    .source_traffic(query("192.0.2.10"), LiveTraffic::default())
+                    .await
+                    .unwrap();
+                assert_eq!(original.rows[0].counts.packets, 3);
+                assert_eq!(
+                    original.rows[0].application_attribution,
+                    ApplicationAttribution::default()
+                );
+
+                let mut row = attributed("nginx", 10);
+                row.first_seen = later_from;
+                row.last_seen = later_from + 9;
+                row.application_attribution.applications[0].observed_from = later_from;
+                row.application_attribution.applications[0].observed_to = later_from + 9;
+                let expected_evidence = row.application_attribution.applications.clone();
+                let mut later = batch(2, vec![row]);
+                later.from = later_from;
+                later.to = later_from + 10;
+                let mut q = query("192.0.2.10");
+                q.to = later.to;
+                let before = db
+                    .source_traffic(
+                        q.clone(),
+                        LiveTraffic {
+                            batches: vec![later.clone()],
+                        },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(before.rows.len(), 1);
+                assert_eq!(before.rows[0].counts.packets, 6);
+                assert_eq!(
+                    (before.rows[0].first_seen, before.rows[0].last_seen),
+                    (120, later_from + 9)
+                );
+                assert_eq!(
+                    before.rows[0].application_attribution.applications,
+                    expected_evidence
+                );
+                assert_eq!(
+                    before.rows[0].application_attribution.reasons,
+                    vec![ApplicationReason::NotCollected]
+                );
+                db.detail_checkpoint(later, config::Retention::default(), 1000)
+                    .await
+                    .unwrap();
+                for resolution in ["minute", "hour"] {
+                    q.resolution = resolution.into();
+                    let after = db
+                        .source_traffic(q.clone(), LiveTraffic::default())
+                        .await
+                        .unwrap();
+                    assert_eq!(after.rows[0].counts.packets, 6);
+                    assert_eq!(
+                        after.rows[0].application_attribution,
+                        before.rows[0].application_attribution
+                    );
+                }
+                if later_from == 180 {
+                    // Selecting only the later minute has no earlier unknown reason.
+                    q.resolution = "minute".into();
+                    q.from = later_from;
+                    let recent = db.source_traffic(q, LiveTraffic::default()).await.unwrap();
+                    assert_eq!(recent.rows[0].counts.packets, 3);
+                    assert_eq!(
+                        recent.rows[0].application_attribution.applications,
+                        expected_evidence
+                    );
+                    assert!(recent.rows[0].application_attribution.reasons.is_empty());
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn saturated_application_sets_are_consistent_before_and_after_commit() {
         let db = Database::open(":memory:").unwrap();
         let mut row = attributed("worker-10", 10);

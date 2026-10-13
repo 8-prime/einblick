@@ -874,6 +874,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn later_attribution_is_merged_into_an_initially_unknown_destination() {
+        let mut m = monitor(true).await;
+        m.applications = crate::applications::Reader::disabled(config::ApplicationConfig {
+            enabled: true,
+            ..config::ApplicationConfig::default()
+        });
+        let now = unix_now();
+        let mut first = m.backend.poll().unwrap();
+        first.traffic.truncate(1);
+        let key = first.traffic[0].key();
+        first.traffic[0].first_seen = now;
+        first.traffic[0].last_seen = now;
+        let first_packets = first.traffic[0].counts.packets;
+        m.process(now, 1.0, first).await;
+        assert!(
+            m.detail[&key]
+                .application_attribution
+                .applications
+                .is_empty()
+        );
+
+        m.applications = crate::applications::Reader::disabled(config::ApplicationConfig {
+            services: vec![config::ServiceLabel {
+                name: "web".into(),
+                destination: format!("{}/32", key.1).parse().unwrap(),
+                protocol: key.3,
+                port: key.4.unwrap(),
+                interface: None,
+            }],
+            ..config::ApplicationConfig::default()
+        });
+        let mut later = m.backend.poll().unwrap();
+        later.traffic.truncate(1);
+        assert_eq!(later.traffic[0].key(), key);
+        later.traffic[0].first_seen = now + 1;
+        later.traffic[0].last_seen = now + 1;
+        let later_packets = later.traffic[0].counts.packets;
+        m.process(now + 1, 1.0, later).await;
+        let row = &m.detail[&key];
+        assert_eq!(row.counts.packets, first_packets + later_packets);
+        assert_eq!((row.first_seen, row.last_seen), (now, now + 1));
+        assert_eq!(row.application_attribution.applications.len(), 1);
+        assert_eq!(row.application_attribution.applications[0].name, "web");
+        assert_eq!(
+            row.application_attribution.applications[0].observed_from,
+            now + 1
+        );
+        assert_eq!(
+            row.application_attribution.reasons,
+            vec![ApplicationReason::Waiting]
+        );
+    }
+
+    #[tokio::test]
     async fn application_budget_preserves_counts_and_recovers_after_checkpoint() {
         let mut m = monitor(true).await;
         m.config.applications.batch_evidence_bytes = 1; // force saturation in this regression

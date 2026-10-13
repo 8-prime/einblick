@@ -943,6 +943,71 @@ mod tests {
     }
 
     #[test]
+    fn newly_discovered_owner_enriches_later_traffic_to_unknown_destination() {
+        let mut reader = reader(Inventory::default());
+        let (sender, state) = watch::channel(CollectorState::default());
+        reader.state = state;
+        let mut earlier = traffic("192.0.2.1", 443);
+        reader.enrich(&mut earlier);
+        assert_eq!(
+            earlier.application_attribution,
+            ApplicationAttribution::unknown(ApplicationReason::Waiting)
+        );
+
+        let mut discovered_owner = owner("nginx", 1);
+        discovered_owner.observed_from = 102;
+        discovered_owner.observed_to = 102;
+        let mut inventory = Inventory {
+            available: true,
+            observed_at: 102,
+            monotonic_ns: monotonic_ns(),
+            local_addresses: vec![earlier.destination],
+            sockets: vec![Endpoint {
+                address: earlier.destination,
+                port: 443,
+                protocol: 6,
+                interface: None,
+                remote: None,
+                remote_port: 0,
+                inode: 1,
+                cookie: 2,
+                v6_only: None,
+                owners: vec![discovered_owner.clone()],
+            }],
+            ..Inventory::default()
+        };
+        inventory.index();
+        sender.send_replace(CollectorState {
+            inventory: Some(inventory),
+            ..CollectorState::default()
+        });
+        let mut later = traffic("192.0.2.1", 443);
+        later.first_seen = 103;
+        later.last_seen = 104;
+        reader.enrich(&mut later);
+        assert_eq!(
+            later.application_attribution.applications,
+            vec![discovered_owner]
+        );
+        assert!(later.application_attribution.reasons.is_empty());
+
+        // The destination aggregate retains both the new evidence and the
+        // earlier gap, without extending the evidence back to the first packet.
+        let earlier_attribution = earlier.application_attribution.clone();
+        earlier.merge(&later);
+        assert_eq!(earlier.counts.packets, 20);
+        assert_eq!((earlier.first_seen, earlier.last_seen), (100, 104));
+        assert_eq!(
+            earlier.application_attribution.applications[0].observed_from,
+            102
+        );
+        assert_eq!(
+            earlier.application_attribution.reasons,
+            earlier_attribution.reasons
+        );
+    }
+
+    #[test]
     fn configured_labels_choose_specific_scope_and_work_without_host_access() {
         use einblick_core::config::ServiceLabel;
         let config = ApplicationConfig {

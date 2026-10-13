@@ -4,6 +4,12 @@ Per-IP traffic shows local application/service candidates beside each destinatio
 and port. Evidence is stored with history; reassigning a port does not relabel old
 records. Counts belong to the whole row, not individual candidate applications.
 
+Destination groups combine traffic across the selected range, so first/last seen
+cover the whole group. Each incoming interval is attributed before grouping;
+an initially unknown destination can gain application evidence from later traffic.
+Earlier missing-attribution reasons remain alongside that evidence and apply to
+part of the range. Newly discovered applications do not relabel old traffic.
+
 ## Enable automatic discovery
 
 Use the existing single image and single Compose service. The updated production

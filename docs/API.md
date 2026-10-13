@@ -102,6 +102,10 @@ or `configured`), nullable `pid`, `process_start`, `executable`, `service`,
 `container_id`, and `observed_from`/`observed_to` evidence time bounds. Rows retain
 at most eight candidates and 4 KiB serialized attribution. Exec/name changes and
 ownership changes are preserved; counters remain totals for the complete row.
+`first_seen`/`last_seen` also cover the complete destination group. Attribution is
+collected per incoming interval before grouping, so later traffic can add application
+evidence to an initially unknown group. Earlier missing-attribution reasons remain
+as partial-range history; they do not suppress new candidates.
 
 Reasons include `not_collected`, `disabled`, `waiting`, `collector_unavailable`,
 `stale`, `permission_denied`, `scan_limit`, `docker_unavailable`,
