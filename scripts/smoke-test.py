@@ -102,11 +102,16 @@ port = 443
         live=http.client.HTTPConnection('127.0.0.1',19081,timeout=5)
         live.request('GET','/api/v1/stream',headers={'Cookie':cookie});response=live.getresponse()
         assert response.status==200
+        previous_totals=api('/snapshot')['totals']
         proc.send_signal(signal.SIGTERM);proc.wait(timeout=8);assert proc.returncode==0
         live.close()
         config.write_text(config.read_text().replace('name = "demo-web"','name = "replacement-web"'))
         proc=subprocess.Popen([str(BINARY),'--config',str(config)],cwd=ROOT,stdout=subprocess.DEVNULL)
         wait();cookie,csrf=login();snapshot=api('/snapshot')
+        assert snapshot['totals']['packets']>=previous_totals['packets'],snapshot
+        assert snapshot['totals']['bytes']>=previous_totals['bytes'],snapshot
+        assert snapshot['totals']['dropped']>=previous_totals['dropped'],snapshot
+        assert snapshot['session_totals']['packets']<snapshot['totals']['packets'],snapshot
         assert snapshot['automatic'] and snapshot['blocking'] and any(r['applied'] for r in snapshot['rules'])
         history=api('/history?from=0');assert history and sum(h['totals']['packets'] for h in history)>0
         restored=api('/sources/192.0.2.24/traffic?port=443')

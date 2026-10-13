@@ -39,13 +39,18 @@ was accepted, not that enforcement succeeded. Inspect `Rule.applied/error` and
 queue failures return errors. An emergency action can return an error after
 successfully disabling kernel blocking if restart settings could not be persisted.
 
-`Snapshot`: `at`, cumulative `totals`, latest-interval `rate`, `sources`, `ports`,
+`Snapshot`: `at`, cumulative `totals`, process-local `session_totals`, latest-interval `rate`, `sources`, `ports`,
 recent `detections`, `rules`, `automatic`, `blocking`, and `health`. `Totals` fields:
 `packets`, `bytes`, `passed`, `dropped`, `parse_limits`, `event_loss`, `map_full`,
 `source_misses`, `port_misses`, `association_misses`. `map_full` remains the combined
 miss total. Detail miss rates follow the collected bank, while cumulative misses
 include the active bank too.
-Counters restart with the process. Source rows include `ip`, `packets`, `bytes`,
+Overview `totals` persist with minute aggregate checkpoints and graceful shutdown,
+and are restored before the first observation. Existing databases bootstrap totals
+from retained hourly history; history already expired before this upgrade cannot
+be recovered. Once saved, totals survive history retention. An abrupt crash can
+lose the current uncommitted minute. `session_totals`, source and port counters
+restart with the process; rates use only new observations. Source rows include `ip`, `packets`, `bytes`,
 `syns`, `generation` (counter lifetime); port rows include `protocol`, `port`, `packets`. Port zero means no parsed
 transport destination. Rates are interval counts, not normalized bandwidth.
 The legacy port summary also conflates a real port zero; association detail below
@@ -87,6 +92,8 @@ optional `available_from`/`available_to` (persisted bucket bounds), `complete`,
 (global retained row count), and `warnings`. Coverage is collector-wide, because
 an overflow can omit an association before its source is known in userspace.
 Absence of rows with incomplete coverage is not evidence of no attempts.
+`attribution_started` marks attribution records, including unknown or unsupported
+results; it does not establish that automatic discovery is enabled or successful.
 
 Stored and live batches merge in one SQLite snapshot; committed batch identities
 prevent double counting. At most 500 bounded records remain below the 4 MiB
@@ -117,7 +124,11 @@ bucket records / 16 MiB of metadata per query; traffic counts stay complete when
 that limit prevents further application enrichment.
 
 `Snapshot.health.applications` includes automatic discovery `enabled`, `state`,
-nullable `last_scan`, discovered `sockets` count, and `reasons`. Attribution health
+nullable `last_scan`, discovered `sockets` count, `owned_sockets` (sockets with at
+least one identified owner), `reasons`, and bounded `diagnostics` strings.
+The `partial` state means scans produce evidence alongside discovery errors;
+individual socket-scan diagnostics identify IPv4/IPv6, TCP/UDP, and the OS error.
+Process-access diagnostics identify the inaccessible metadata stage. Attribution health
 is independent of traffic/detection completeness and `/healthz` readiness.
 See [application attribution](APPLICATION_ATTRIBUTION.md) for deployment and limits.
 

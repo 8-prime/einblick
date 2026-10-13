@@ -121,6 +121,8 @@ pub struct MapHealth {
 pub struct Snapshot {
     pub at: i64,
     pub totals: Totals,
+    #[serde(default)]
+    pub session_totals: Totals,
     pub rate: Totals,
     pub sources: Vec<Source>,
     pub ports: Vec<Port>,

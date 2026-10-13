@@ -51,6 +51,8 @@ struct Inventory {
     monotonic_ns: u64,
     available: bool,
     reasons: Vec<ApplicationReason>,
+    #[serde(default)]
+    diagnostics: Vec<String>,
     local_addresses: Vec<IpAddr>,
     sockets: Vec<Endpoint>,
     published: Vec<PublishedEndpoint>,
@@ -105,9 +107,19 @@ impl Reader {
         if let Some(inventory) = &state.inventory {
             health.last_scan = Some(inventory.observed_at);
             health.sockets = inventory.sockets.len();
+            health.owned_sockets = inventory
+                .sockets
+                .iter()
+                .filter(|s| !s.owners.is_empty())
+                .count();
+            health.diagnostics = inventory.diagnostics.clone();
             health.reasons = inventory.reasons.clone();
             health.state = if inventory.available {
-                "observing"
+                if inventory.reasons.is_empty() {
+                    "observing"
+                } else {
+                    "partial"
+                }
             } else {
                 "unavailable"
             }
@@ -493,6 +505,12 @@ fn write_frame(writer: &mut impl Write, data: &[u8]) -> Result<()> {
 }
 
 impl Inventory {
+    fn diagnostic(&mut self, message: impl AsRef<str>) {
+        let message = application_text(message.as_ref());
+        if self.diagnostics.len() < 8 && !self.diagnostics.contains(&message) {
+            self.diagnostics.push(message);
+        }
+    }
     fn index(&mut self) {
         self.socket_index.clear();
         self.published_index.clear();
@@ -515,7 +533,12 @@ impl Inventory {
             self.sockets.len() <= SOCKET_LIMIT
                 && self.published.len() <= SOCKET_LIMIT
                 && self.local_addresses.len() <= LOCAL_ADDRESS_LIMIT
-                && self.reasons.len() <= 14,
+                && self.reasons.len() <= 14
+                && self.diagnostics.len() <= 8
+                && self
+                    .diagnostics
+                    .iter()
+                    .all(|d| d.len() <= APPLICATION_TEXT_LIMIT),
             "collector inventory exceeds capacity"
         );
         for endpoint in &self.sockets {
@@ -577,23 +600,43 @@ fn discover(config: &ApplicationConfig) -> Inventory {
         monotonic_ns: monotonic_ns(),
         ..Inventory::default()
     };
-    let Ok(boot) = read_small(root.join("sys/kernel/random/boot_id")) else {
-        inventory
-            .reasons
-            .push(ApplicationReason::CollectorUnavailable);
-        return inventory;
+    let boot = match read_small(root.join("sys/kernel/random/boot_id")) {
+        Ok(boot) => boot,
+        Err(error) => {
+            inventory
+                .reasons
+                .push(ApplicationReason::CollectorUnavailable);
+            inventory.diagnostic(format!(
+                "Host proc boot ID: {error}; check proc_root and the host proc mount"
+            ));
+            return inventory;
+        }
     };
-    let Ok(processes) = std::fs::read_dir(root) else {
-        inventory.reasons.push(ApplicationReason::PermissionDenied);
-        return inventory;
+    let processes = match std::fs::read_dir(root) {
+        Ok(processes) => processes,
+        Err(error) => {
+            inventory.reasons.push(ApplicationReason::PermissionDenied);
+            inventory.diagnostic(format!("Host proc directory: {error}"));
+            return inventory;
+        }
     };
-    let Ok(namespace) = std::fs::read_link("/proc/self/ns/net") else {
-        return inventory;
+    let namespace = match std::fs::read_link("/proc/self/ns/net") {
+        Ok(namespace) => namespace,
+        Err(error) => {
+            inventory
+                .reasons
+                .push(ApplicationReason::CollectorUnavailable);
+            inventory.diagnostic(format!("Collector network namespace: {error}"));
+            return inventory;
+        }
     };
-    let (endpoints, reasons, available) = sockets::discover();
+    let (endpoints, reasons, available, diagnostics) = sockets::discover();
     inventory.sockets = endpoints;
     inventory.reasons = reasons;
     inventory.available = available;
+    for diagnostic in diagnostics {
+        inventory.diagnostic(diagnostic);
+    }
     inventory.local_addresses = sockets::local_addresses();
     if inventory.local_addresses.len() == LOCAL_ADDRESS_LIMIT {
         inventory.reasons.push(ApplicationReason::ScanLimit);
@@ -627,6 +670,7 @@ fn discover(config: &ApplicationConfig) -> Inventory {
             Ok(net) if net == namespace => {}
             Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
                 denied = true;
+                inventory.diagnostic(format!("Process network namespace: {error}"));
                 continue;
             }
             _ => continue,
@@ -641,6 +685,9 @@ fn discover(config: &ApplicationConfig) -> Inventory {
             Ok(fd) => fd,
             Err(error) => {
                 denied |= error.kind() == std::io::ErrorKind::PermissionDenied;
+                if error.kind() == std::io::ErrorKind::PermissionDenied {
+                    inventory.diagnostic(format!("Process file-descriptor directory: {error}"));
+                }
                 continue;
             }
         };
@@ -666,7 +713,12 @@ fn discover(config: &ApplicationConfig) -> Inventory {
                         inodes.insert(inode);
                     }
                 }
-                Err(error) => denied |= error.kind() == std::io::ErrorKind::PermissionDenied,
+                Err(error) => {
+                    denied |= error.kind() == std::io::ErrorKind::PermissionDenied;
+                    if error.kind() == std::io::ErrorKind::PermissionDenied {
+                        inventory.diagnostic(format!("Process socket descriptor: {error}"));
+                    }
+                }
             }
         }
         if !inodes.is_empty()
@@ -1038,6 +1090,69 @@ mod tests {
             ApplicationMethod::Configured
         );
         assert!(row.application_attribution.reasons.is_empty());
+    }
+
+    #[test]
+    fn partial_discovery_health_reports_owned_sockets_and_bounded_errors() {
+        let mut inventory = Inventory {
+            reasons: vec![
+                ApplicationReason::CollectorUnavailable,
+                ApplicationReason::PermissionDenied,
+            ],
+            sockets: vec![Endpoint {
+                address: "127.0.0.1".parse().unwrap(),
+                port: 443,
+                protocol: 6,
+                interface: None,
+                remote: None,
+                remote_port: 0,
+                inode: 1,
+                cookie: 2,
+                v6_only: None,
+                owners: vec![owner("nginx", 1)],
+            }],
+            ..Inventory::default()
+        };
+        inventory.diagnostic(
+            "IPv6 UDP socket scan: diagnostic kernel error: Permission denied (os error 13)",
+        );
+        inventory.diagnostic("Process network namespace: Permission denied (os error 13)");
+        inventory.diagnostic("Process network namespace: Permission denied (os error 13)");
+        let reader = reader(inventory.clone());
+        let health = reader.health();
+        assert_eq!(health.state, "partial");
+        assert_eq!(health.sockets, 1);
+        assert_eq!(health.owned_sockets, 1);
+        assert_eq!(health.diagnostics.len(), 2);
+        assert!(health.diagnostics[0].starts_with("IPv6 UDP socket scan:"));
+        for i in 0..20 {
+            inventory.diagnostic(format!("{i}:{}", "é".repeat(200)));
+        }
+        assert_eq!(inventory.diagnostics.len(), 8);
+        assert!(
+            inventory
+                .diagnostics
+                .iter()
+                .all(|d| d.len() <= APPLICATION_TEXT_LIMIT)
+        );
+        assert!(inventory.validate().is_ok());
+        inventory.diagnostics.push("extra".into());
+        assert!(inventory.validate().is_err());
+    }
+
+    #[test]
+    fn missing_host_proc_has_actionable_health_diagnostics() {
+        let inventory = discover(&ApplicationConfig {
+            proc_root: "/dev/null/host-proc".into(),
+            ..ApplicationConfig::default()
+        });
+        assert!(!inventory.available);
+        assert_eq!(
+            inventory.reasons,
+            vec![ApplicationReason::CollectorUnavailable]
+        );
+        assert!(inventory.diagnostics[0].starts_with("Host proc boot ID:"));
+        assert!(inventory.diagnostics[0].contains("check proc_root"));
     }
 
     #[test]

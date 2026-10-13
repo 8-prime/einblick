@@ -8,10 +8,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(super) fn discover() -> (Vec<Endpoint>, Vec<ApplicationReason>, bool) {
+pub(super) fn discover() -> (Vec<Endpoint>, Vec<ApplicationReason>, bool, Vec<String>) {
     let mut sockets = vec![];
     let mut reasons = vec![];
     let mut successes = 0;
+    let mut diagnostics = vec![];
     for family in [libc::AF_INET, libc::AF_INET6] {
         for protocol in [6, 17] {
             match dump(family as u8, protocol, &mut sockets) {
@@ -21,13 +22,22 @@ pub(super) fn discover() -> (Vec<Endpoint>, Vec<ApplicationReason>, bool) {
                         reasons.push(ApplicationReason::ScanLimit);
                     }
                 }
-                Err(_) => reasons.push(ApplicationReason::CollectorUnavailable),
+                Err(error) => {
+                    reasons.push(ApplicationReason::CollectorUnavailable);
+                    let family = if family == libc::AF_INET {
+                        "IPv4"
+                    } else {
+                        "IPv6"
+                    };
+                    let protocol = if protocol == 6 { "TCP" } else { "UDP" };
+                    diagnostics.push(format!("{family} {protocol} socket scan: {error:#}"));
+                }
             }
         }
     }
     reasons.sort();
     reasons.dedup();
-    (sockets, reasons, successes > 0)
+    (sockets, reasons, successes > 0, diagnostics)
 }
 
 fn dump(family: u8, protocol: u8, sockets: &mut Vec<Endpoint>) -> Result<bool> {
@@ -142,7 +152,16 @@ fn dump(family: u8, protocol: u8, sockets: &mut Vec<Endpoint>) -> Result<bool> {
                     }
                     return Ok(limited);
                 }
-                2 => bail!("diagnostic kernel error"),
+                2 => {
+                    ensure!(payload.len() >= 4, "short diagnostic kernel error");
+                    let code = i32::from_ne_bytes(payload[..4].try_into()?);
+                    if code != 0 {
+                        bail!(
+                            "diagnostic kernel error: {}",
+                            std::io::Error::from_raw_os_error(code.saturating_neg())
+                        );
+                    }
+                }
                 20 => {
                     let endpoint = parse_endpoint(payload, protocol)?;
                     if endpoint.port != 0 {

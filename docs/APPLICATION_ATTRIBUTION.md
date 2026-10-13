@@ -41,6 +41,40 @@ inspection capabilities; the read-only mount is not a read-only security boundar
 The profile targets rootful Linux Docker without user namespace remapping.
 LSM/hidepid restrictions can still prevent access and are disclosed in evidence.
 
+After changing Compose mounts or capabilities, recreate the service so Docker
+applies the new container configuration:
+
+```sh
+docker compose up -d --force-recreate einblick
+```
+
+`docker compose restart` restarts the existing container with its existing mounts
+and capabilities. Check **Health → Application discovery** for the current state,
+socket count, and errors; destination rows retain reasons from earlier traffic
+and can still include `disabled` after discovery has been enabled.
+Health shows `partial` when discovery finds sockets but reports scan/access errors,
+with the number of sockets having identified owners and bounded error details.
+`Collector or socket scan unavailable` can refer to one failed address-family/
+protocol scan while other scans succeed; its diagnostic identifies which failed.
+
+On AppArmor hosts, Docker's `docker-default` profile permits ptrace-style metadata
+access only between processes using that same profile. Host process namespace/fd
+reads can therefore remain denied even with SYS_PTRACE and DAC_READ_SEARCH.
+Check the host kernel journal for AppArmor denials involving `einblick`,
+`docker-default`, or `ptrace`:
+
+```sh
+sudo journalctl -k --since "10 minutes ago" --no-pager | grep -E 'apparmor="DENIED".*(einblick|docker-default|ptrace)'
+```
+
+For a container-scoped diagnostic, append `apparmor:unconfined` to this service's
+`security_opt` and recreate it. This removes AppArmor confinement from this
+container; it does not disable AppArmor on the host. If ownership discovery then
+works, use a custom AppArmor profile permitting the collector's host metadata
+reads for a confined deployment. Target processes' own AppArmor profiles can
+also impose access restrictions. The default policy is documented in
+[Docker's AppArmor profile template](https://github.com/moby/profiles/blob/main/apparmor/template.go).
+
 The Rust entrypoint starts a child of the same executable in internal collector
 mode before creating threads or opening administrator secrets, SQLite, or XDP
 descriptors. The child retains only inspection capabilities. The HTTP/monitor

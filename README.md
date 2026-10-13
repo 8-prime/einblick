@@ -158,6 +158,13 @@ protocol/port detail, top 100 sources, and evidence completeness. Source detail 
 approximate top-N: the difference between aggregate totals and retained source
 counts is the other/untracked bucket. Raw packet events are not retained.
 
+Overview packet/byte/pass/drop totals restore from SQLite on restart. They are
+saved atomically with minute aggregates and at graceful shutdown, and survive
+history expiration. Existing databases initially use retained hourly history;
+already expired traffic cannot be reconstructed. An abrupt crash can lose the
+uncommitted minute. Live rates and current source/port summaries cover the current
+process; historical detail remains available through the source inspector.
+
 Select a source IP in Overview or Traffic, or enter an IPv4/IPv6 address in
 **Inspect a source IP**. The detail view associates it with destination addresses,
 interfaces, protocols, and destination ports. It includes packets/bytes, TCP

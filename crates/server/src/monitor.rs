@@ -37,6 +37,7 @@ pub struct Monitor {
     blocking: bool,
     detector: Detector,
     previous: Totals,
+    persisted_totals: Totals,
     sources: HashMap<IpAddr, Source>,
     ports: HashMap<(u8, u16), u64>,
     recent: Vec<Detection>,
@@ -90,7 +91,8 @@ impl Monitor {
         db.applied(rules.clone()).await?;
         let detector = Detector::new(config.detection.clone(), config.source_capacity as usize);
         let applications = crate::applications::Reader::disabled(config.applications.clone());
-        Ok(Self {
+        let persisted_totals = db.overview_totals().await?;
+        let monitor = Self {
             config,
             db,
             backend,
@@ -99,6 +101,7 @@ impl Monitor {
             blocking,
             detector,
             previous: Totals::default(),
+            persisted_totals,
             sources: HashMap::new(),
             ports: HashMap::new(),
             recent: vec![],
@@ -137,7 +140,9 @@ impl Monitor {
             evidence_gap: false,
             applications,
             application_bytes: 0,
-        })
+        };
+        monitor.publish(Totals::default(), false).await;
+        Ok(monitor)
     }
     pub async fn run(
         mut self,
@@ -631,9 +636,12 @@ impl Monitor {
             .collect::<Vec<_>>();
         ports.sort_by_key(|p| std::cmp::Reverse(p.packets));
         ports.truncate(100);
+        let mut totals = self.persisted_totals.clone();
+        totals.add(&self.previous);
         let snap = Snapshot {
             at: unix_now(),
-            totals: self.previous.clone(),
+            totals,
+            session_totals: self.previous.clone(),
             rate,
             sources,
             ports,
@@ -747,6 +755,55 @@ mod tests {
         let (updates, _) = broadcast::channel(4);
         Monitor::new(c, db, snapshot, updates).await.unwrap()
     }
+    #[tokio::test]
+    async fn overview_totals_restore_without_inflating_live_rates_or_checkpoints() {
+        let mut first = monitor(false).await;
+        let now = unix_now();
+        let observation = first.backend.poll().unwrap();
+        let original_packets = observation.totals.packets;
+        first.process(now, 1.0, observation).await;
+        first
+            .db
+            .aggregate(first.bucket.clone(), first.config.retention.clone())
+            .await
+            .unwrap();
+        first.bucket.totals = Totals::default();
+        // Saving history in this process must not add it again to the overview.
+        first.publish(Totals::default(), true).await;
+        assert_eq!(first.snapshot.read().await.totals.packets, original_packets);
+
+        let snapshot = Arc::new(RwLock::new(Snapshot::default()));
+        let (updates, _) = broadcast::channel(4);
+        let mut restarted = Monitor::new(first.config.clone(), first.db.clone(), snapshot, updates)
+            .await
+            .unwrap();
+        {
+            let restored = restarted.snapshot.read().await;
+            assert_eq!(restored.totals.packets, original_packets);
+            assert_eq!(restored.session_totals.packets, 0);
+            assert_eq!(restored.rate.packets, 0);
+        }
+        for second in 1..=2 {
+            let observation = restarted.backend.poll().unwrap();
+            let expected_rate = observation.totals.packets - restarted.previous.packets;
+            let expected_session = observation.totals.packets;
+            restarted.process(now + second, 1.0, observation).await;
+            let current = restarted.snapshot.read().await;
+            assert_eq!(current.totals.packets, original_packets + expected_session);
+            assert_eq!(current.session_totals.packets, expected_session);
+            assert_eq!(current.rate.packets, expected_rate);
+        }
+        restarted
+            .db
+            .aggregate(restarted.bucket.clone(), restarted.config.retention.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            restarted.db.overview_totals().await.unwrap().packets,
+            restarted.snapshot.read().await.totals.packets
+        );
+    }
+
     #[tokio::test]
     async fn activation_requires_management_and_acknowledgment() {
         let mut m = monitor(false).await;

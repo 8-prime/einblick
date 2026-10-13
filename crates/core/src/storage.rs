@@ -1,4 +1,4 @@
-use crate::{Aggregate, Event, Rule, RuleKind, config::Retention};
+use crate::{Aggregate, Event, Rule, RuleKind, Totals, config::Retention};
 use anyhow::{Context, Result, anyhow, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
@@ -13,6 +13,28 @@ use std::{
 use tokio::sync::oneshot;
 
 type Job = Box<dyn FnOnce(&mut Connection) + Send>;
+
+fn overview_totals(c: &Connection) -> Result<Totals> {
+    if let Some(data) = c
+        .query_row(
+            "SELECT value FROM settings WHERE key='overview_totals'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(serde_json::from_str(&data)?);
+    }
+    // Bootstrap older databases from a single resolution. Minute and hour
+    // histories overlap; summing both would count the same traffic twice.
+    let mut totals = Totals::default();
+    let mut s =
+        c.prepare("SELECT json_extract(data,'$.totals') FROM aggregates WHERE resolution='hour'")?;
+    for data in s.query_map([], |r| r.get::<_, String>(0))? {
+        totals.add(&serde_json::from_str::<Totals>(&data?)?);
+    }
+    Ok(totals)
+}
 #[derive(Clone)]
 pub struct Database {
     tx: SyncSender<Job>,
@@ -254,6 +276,8 @@ impl Database {
     pub async fn aggregate(&self, minute: Aggregate, retention: Retention) -> Result<()> {
         self.call(move|c| {
         let t=c.transaction()?;
+        let mut totals=overview_totals(&t)?;
+        totals.add(&minute.totals);
         let hour=minute.at/3600*3600;
         let old=t.query_row("SELECT data FROM aggregates WHERE resolution='hour' AND at=?",[hour],|r|r.get::<_,String>(0)).optional()?;
         let mut hourly=if let Some(v)=old {serde_json::from_str::<Aggregate>(&v)?}else{Aggregate{at:hour,totals:Default::default(),sources:vec![],ports:vec![],complete:true}};
@@ -274,11 +298,15 @@ impl Database {
             combined.ports.sort_by_key(|p|std::cmp::Reverse(p.packets));combined.ports.truncate(4096);
         }
         for (res,agg) in [("minute",combined),("hour",hourly)] { t.execute("INSERT INTO aggregates(resolution,at,data) VALUES(?,?,?) ON CONFLICT(resolution,at) DO UPDATE SET data=excluded.data",params![res,agg.at,serde_json::to_string(&agg)?])?; }
+        t.execute("INSERT INTO settings(key,value) VALUES('overview_totals',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(&totals)?])?;
         for (res,days) in [("minute",retention.minute_days),("hour",retention.hourly_days)] {t.execute("DELETE FROM aggregates WHERE resolution=? AND at<?",params![res,minute.at-days*86400])?;}
         t.execute("DELETE FROM events WHERE at<?",[minute.at-retention.event_days*86400])?;
         t.execute("DELETE FROM rules WHERE (enabled=0 OR expires<?) AND created<?",params![minute.at,minute.at-retention.event_days*86400])?;
         t.commit()?;Ok(())
     }).await
+    }
+    pub async fn overview_totals(&self) -> Result<Totals> {
+        self.read(|c| overview_totals(c)).await
     }
     pub async fn history(&self, resolution: String, from: i64, to: i64) -> Result<Vec<Aggregate>> {
         self.read(move|c| {
@@ -391,6 +419,99 @@ mod tests {
 #[cfg(test)]
 mod restart_tests {
     use super::*;
+    fn bucket(at: i64, packets: u64) -> Aggregate {
+        Aggregate {
+            at,
+            totals: Totals {
+                packets,
+                bytes: packets * 100,
+                passed: packets - 1,
+                dropped: 1,
+                parse_limits: 2,
+                event_loss: 3,
+                map_full: 4,
+                source_misses: 1,
+                port_misses: 1,
+                association_misses: 2,
+            },
+            sources: vec![],
+            ports: vec![],
+            complete: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn overview_totals_bootstrap_once_and_survive_retention_and_reopen() {
+        let path = std::env::temp_dir().join(format!(
+            "einblick-overview-{}-{}.sqlite",
+            std::process::id(),
+            crate::unix_now()
+        ));
+        let db = Database::open(path.to_str().unwrap()).unwrap();
+        let at = crate::unix_now() / 3600 * 3600;
+        let first = bucket(at, 12);
+        // Seed a pre-upgrade database with overlapping minute/hour histories.
+        let seed = first.clone();
+        db.call(move |c| {
+            for resolution in ["minute", "hour"] {
+                c.execute(
+                    "INSERT INTO aggregates VALUES(?,?,?)",
+                    params![resolution, seed.at, serde_json::to_string(&seed)?],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(db.overview_totals().await.unwrap()).unwrap(),
+            serde_json::to_value(&first.totals).unwrap()
+        );
+        // A second partial minute adds only its delta, including during bootstrap.
+        let second = bucket(at, 7);
+        db.aggregate(second.clone(), Retention::default())
+            .await
+            .unwrap();
+        let mut expected = first.totals.clone();
+        expected.add(&second.totals);
+        let later = bucket(at + 91 * 86400, 5);
+        db.aggregate(later.clone(), Retention::default())
+            .await
+            .unwrap();
+        expected.add(&later.totals);
+        assert!(db.history("hour".into(), at, at).await.unwrap().is_empty());
+        let reopened = Database::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(reopened.overview_totals().await.unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+        drop(reopened);
+        drop(db);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_aggregate_does_not_advance_overview_totals() {
+        let db = Database::open(":memory:").unwrap();
+        let first = bucket(120, 12);
+        db.aggregate(first.clone(), Retention::default())
+            .await
+            .unwrap();
+        db.call(|c| {
+            c.execute_batch("CREATE TRIGGER reject_aggregate BEFORE INSERT ON aggregates BEGIN SELECT RAISE(ABORT,'test write failure'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        assert!(
+            db.aggregate(bucket(180, 7), Retention::default())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            serde_json::to_value(db.overview_totals().await.unwrap()).unwrap(),
+            serde_json::to_value(first.totals).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn partial_minutes_merge_across_restarts_without_hourly_double_counting() {
         let db = Database::open(":memory:").unwrap();

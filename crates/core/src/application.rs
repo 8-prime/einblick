@@ -140,6 +140,10 @@ pub struct ApplicationHealth {
     pub state: String,
     pub last_scan: Option<i64>,
     pub sockets: usize,
+    #[serde(default)]
+    pub owned_sockets: usize,
+    #[serde(default)]
+    pub diagnostics: Vec<String>,
     pub reasons: Vec<ApplicationReason>,
 }
 
