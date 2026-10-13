@@ -15,11 +15,26 @@ pub(super) fn discover() -> (Vec<Endpoint>, Vec<ApplicationReason>, bool, Vec<St
     let mut diagnostics = vec![];
     for family in [libc::AF_INET, libc::AF_INET6] {
         for protocol in [6, 17] {
+            let before = sockets.len();
             match dump(family as u8, protocol, &mut sockets) {
                 Ok(limited) => {
                     successes += 1;
                     if limited {
                         reasons.push(ApplicationReason::ScanLimit);
+                    }
+                    for endpoint in sockets[before..]
+                        .iter()
+                        .filter(|s| s.interface_index != 0 && s.interface.is_none())
+                        .take(4)
+                    {
+                        reasons.push(ApplicationReason::CollectorUnavailable);
+                        let family = if family == libc::AF_INET {
+                            "IPv4"
+                        } else {
+                            "IPv6"
+                        };
+                        let protocol = if protocol == 6 { "TCP" } else { "UDP" };
+                        diagnostics.push(format!("{family} {protocol}: interface index {} unresolved; socket excluded from attribution", endpoint.interface_index));
                     }
                 }
                 Err(error) => {
@@ -189,13 +204,14 @@ fn parse_endpoint(payload: &[u8], protocol: u8) -> Result<Endpoint> {
     } else {
         let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
         if unsafe { libc::if_indextoname(index, name.as_mut_ptr()) }.is_null() {
-            bail!("unknown bound interface");
+            None
+        } else {
+            Some(
+                unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
         }
-        Some(
-            unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
-                .to_string_lossy()
-                .into_owned(),
-        )
     };
     let mut v6_only = None;
     let mut at = 72;
@@ -218,6 +234,7 @@ fn parse_endpoint(payload: &[u8], protocol: u8) -> Result<Endpoint> {
         remote_port: u16::from_be_bytes(payload[6..8].try_into()?),
         protocol,
         interface,
+        interface_index: index,
         inode: u32::from_ne_bytes(payload[68..72].try_into()?),
         cookie: u64::from_ne_bytes(payload[44..52].try_into()?),
         v6_only,
@@ -268,6 +285,32 @@ pub(super) fn local_addresses() -> Vec<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unresolved_ipv6_udp_interface_does_not_abort_following_endpoints() {
+        let loopback = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+        assert!(loopback > 0);
+        let mut payload = [0u8; 72];
+        payload[0] = libc::AF_INET6 as u8;
+        payload[68..72].copy_from_slice(&1u32.to_ne_bytes());
+        let mut endpoints = vec![];
+        // A failed lookup used to return an error here, aborting the UDP dump
+        // before any subsequent sockets could be collected.
+        for (port, index) in [(57034u16, u32::MAX), (57035, loopback), (57036, 0)] {
+            payload[4..6].copy_from_slice(&port.to_be_bytes());
+            payload[40..44].copy_from_slice(&index.to_ne_bytes());
+            endpoints.push(parse_endpoint(&payload, 17).unwrap());
+        }
+        assert_eq!(endpoints.len(), 3);
+        assert_eq!(endpoints[0].interface_index, u32::MAX);
+        assert!(endpoints[0].interface.is_none());
+        assert!(!endpoints[0].matches_interface("lo"));
+        assert!(!endpoints[0].matches_interface("4294967295"));
+        assert_eq!(endpoints[1].interface.as_deref(), Some("lo"));
+        assert!(endpoints[1].matches_interface("lo"));
+        assert!(!endpoints[1].matches_interface("eth0"));
+        assert!(endpoints[2].matches_interface("eth0"));
+    }
 
     #[test]
     fn discovers_real_tcp_and_udp_endpoints() {

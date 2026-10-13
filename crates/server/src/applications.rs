@@ -29,12 +29,25 @@ struct Endpoint {
     port: u16,
     protocol: u8,
     interface: Option<String>,
+    #[serde(default)]
+    interface_index: u32,
     remote: Option<IpAddr>,
     remote_port: u16,
     inode: u32,
     cookie: u64,
     v6_only: Option<bool>,
     owners: Vec<ApplicationEvidence>,
+}
+
+impl Endpoint {
+    fn matches_interface(&self, interface: &str) -> bool {
+        match &self.interface {
+            Some(name) => name == interface,
+            // A nonzero index with no name is an unresolved binding, not an
+            // unbound socket. Never let it match traffic on arbitrary devices.
+            None => self.interface_index == 0,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -221,10 +234,7 @@ impl Reader {
                     if local
                         && endpoint.port == port
                         && endpoint.protocol == row.protocol
-                        && endpoint
-                            .interface
-                            .as_ref()
-                            .is_none_or(|i| i == &row.interface)
+                        && endpoint.matches_interface(&row.interface)
                         && endpoint.remote.is_none_or(|remote| remote == row.source)
                         && (endpoint.remote_port == 0
                             || row.source_ports.contains(&endpoint.remote_port))
@@ -921,6 +931,7 @@ mod tests {
                 port: 443,
                 protocol: 6,
                 interface: None,
+                interface_index: 0,
                 remote: None,
                 remote_port: 0,
                 inode: 1,
@@ -943,6 +954,41 @@ mod tests {
                 .reasons
                 .contains(&ApplicationReason::NoMatchingSocket)
         );
+    }
+
+    #[test]
+    fn unresolved_bound_socket_cannot_gain_wildcard_interface_attribution() {
+        let mut unresolved = Endpoint {
+            address: "::".parse().unwrap(),
+            port: 57034,
+            protocol: 17,
+            interface: None,
+            interface_index: u32::MAX,
+            remote: None,
+            remote_port: 0,
+            inode: 1,
+            cookie: 2,
+            v6_only: Some(true),
+            owners: vec![owner("unresolved", 1)],
+        };
+        let mut row = traffic("2001:db8::1", 57034);
+        row.protocol = 17;
+        let mut inventory = Inventory {
+            local_addresses: vec![row.destination],
+            sockets: vec![unresolved.clone()],
+            ..Inventory::default()
+        };
+        reader(inventory.clone()).enrich(&mut row);
+        assert!(row.application_attribution.applications.is_empty());
+        // Valid sockets collected after the unresolved one still attribute.
+        unresolved.interface = Some(row.interface.clone());
+        unresolved.interface_index = 1;
+        unresolved.owners = vec![owner("resolved", 2)];
+        inventory.sockets.push(unresolved);
+        reader(inventory).enrich(&mut row);
+        assert_eq!(row.application_attribution.applications.len(), 1);
+        assert_eq!(row.application_attribution.applications[0].name, "resolved");
+        assert_eq!(row.counts.packets, 10);
     }
 
     #[test]
@@ -1019,6 +1065,7 @@ mod tests {
                 port: 443,
                 protocol: 6,
                 interface: None,
+                interface_index: 0,
                 remote: None,
                 remote_port: 0,
                 inode: 1,
@@ -1104,6 +1151,7 @@ mod tests {
                 port: 443,
                 protocol: 6,
                 interface: None,
+                interface_index: 0,
                 remote: None,
                 remote_port: 0,
                 inode: 1,

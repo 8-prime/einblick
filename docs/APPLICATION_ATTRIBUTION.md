@@ -56,6 +56,10 @@ Health shows `partial` when discovery finds sockets but reports scan/access erro
 with the number of sockets having identified owners and bounded error details.
 `Collector or socket scan unavailable` can refer to one failed address-family/
 protocol scan while other scans succeed; its diagnostic identifies which failed.
+An unresolved socket interface index no longer aborts the rest of its scan. That
+socket retains its binding index and is excluded from attribution until its name
+can be resolved; it never becomes a listener matching arbitrary interfaces.
+Other sockets from the same scan continue to provide application evidence.
 
 On AppArmor hosts, Docker's `docker-default` profile permits ptrace-style metadata
 access only between processes using that same profile. Host process namespace/fd
