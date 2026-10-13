@@ -63,6 +63,27 @@ inputs. Storage/enforcement failures continue to suspend new automatic bans.
 Commands preserve the latest telemetry health. Session metadata also includes
 `detail_limits`: configured `minute_days`, `hourly_days`, and `row_limit`.
 
+## IP enrichment
+
+Live `sources` in snapshots/SSE optionally include `ip_info`, and source traffic
+detail responses include nullable `ip_info`, even for an untracked address. Its
+fields are nullable `country_code`, `country`, `asn` (numeric), and `organization`.
+Values come from local DB-IP Lite country/ASN databases; either can be available
+independently. Private, local, documentation and unmapped addresses return no
+context. IPv4-mapped IPv6 is canonicalized for lookup. Historical traffic detail
+uses the current databases; enrichment is not persisted as historical evidence.
+Legacy `/history` aggregates are not enriched.
+
+`health.ip_enrichment` contains `enabled`, `state`, `country`, `asn`, nullable
+`last_check`, and nullable `last_error`. Each database has nullable `release`
+(`YYYY-MM`) and `build_at` (UTC Unix seconds). States are `disabled`, `waiting`,
+`downloading`, `ready`, `stale`, `partial`, and `unavailable`. `ready` means both
+databases match the current UTC month; `stale` means both are loaded but at least
+one is older. `last_check` records the start of the latest check. Failed downloads
+retain usable cached data, so `last_error` can coexist with available context.
+Enrichment availability never changes telemetry completeness or ban eligibility.
+Downloads are disabled in mock mode.
+
 ## Source traffic detail
 
 `GET /api/v1/sources/{ip}/traffic` accepts canonicalizable IPv4/IPv6, including a

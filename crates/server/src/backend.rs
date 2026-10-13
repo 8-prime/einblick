@@ -446,6 +446,7 @@ impl Kernel {
             }
             sources.push(Source {
                 ip: ip(a),
+                ip_info: None,
                 packets: values.iter().map(|v| v.packets).sum(),
                 bytes: values.iter().map(|v| v.bytes).sum(),
                 syns: values.iter().map(|v| v.syns).sum(),
@@ -729,6 +730,7 @@ impl Mock {
                     bytes,
                     syns,
                     generation: 1,
+                    ip_info: None,
                 })
                 .collect(),
             ports: self

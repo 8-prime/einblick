@@ -2,6 +2,7 @@ mod api;
 mod applications;
 mod auth;
 mod backend;
+mod ip_enrichment;
 mod monitor;
 use anyhow::{Context, Result};
 use einblick_core::{Config, Snapshot, storage::Database};
@@ -82,6 +83,7 @@ async fn run(
     let (commands, rx) = mpsc::channel(16);
     let (updates, _) = broadcast::channel(4);
     let (stop, _) = broadcast::channel(1);
+    let enrichment = ip_enrichment::Enrichment::start(&config, stop.subscribe());
     let mut monitor = monitor::Monitor::new(
         config.clone(),
         db.clone(),
@@ -92,6 +94,7 @@ async fn run(
     if let Some(collector) = &collector {
         monitor.applications = collector.reader.clone();
     }
+    monitor.ip_enrichment = enrichment.clone();
     let listener = tokio::net::TcpListener::bind(config.bind)
         .await
         .context("bind HTTP listener")?;
@@ -101,6 +104,7 @@ async fn run(
         auth,
         snapshot,
         live_traffic: monitor.live_traffic.clone(),
+        ip_enrichment: enrichment,
         commands,
         updates,
         shutdown: stop.clone(),

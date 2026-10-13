@@ -139,6 +139,7 @@ pub struct TrafficQuery {
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct TrafficPage {
+    pub ip_info: Option<crate::IpInfo>,
     pub rows: Vec<TrafficRecord>,
     pub next_cursor: Option<String>,
     pub capture_started: Option<i64>,

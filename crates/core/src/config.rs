@@ -28,6 +28,25 @@ pub struct Config {
     pub detection: Thresholds,
     pub retention: Retention,
     pub applications: ApplicationConfig,
+    pub ip_enrichment: IpEnrichmentConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct IpEnrichmentConfig {
+    pub enabled: bool,
+    /// Empty uses an ip-enrichment directory beside the history database.
+    pub directory: String,
+    pub check_seconds: u64,
+}
+impl Default for IpEnrichmentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            directory: String::new(),
+            check_seconds: 86400,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -126,6 +145,7 @@ impl Default for Config {
             detection: Thresholds::default(),
             retention: Retention::default(),
             applications: ApplicationConfig::default(),
+            ip_enrichment: IpEnrichmentConfig::default(),
         }
     }
 }
@@ -137,6 +157,14 @@ impl Config {
     }
     pub fn validate(&self) -> Result<()> {
         self.applications.validate()?;
+        ensure!(
+            (3600..=7 * 86400).contains(&self.ip_enrichment.check_seconds),
+            "IP enrichment check_seconds must be between one hour and seven days"
+        );
+        ensure!(
+            self.ip_enrichment.directory.len() <= 4096,
+            "IP enrichment directory too long"
+        );
         ensure!(
             self.mock || !self.interfaces.is_empty(),
             "configure at least one interface, or use mock=true"

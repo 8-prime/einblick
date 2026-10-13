@@ -220,7 +220,7 @@ impl Database {
             let response_limited=keep<out.len();out.truncate(keep);
             let next_cursor = if has_more || response_limited {out.last().map(|r|serde_json::to_string(&r.cursor())).transpose()?}else{None};
             if response_limited {warnings.push("Response size limit reached; load the next page.".into());}
-            Ok(TrafficPage{rows:out,next_cursor,capture_started,attribution_started,available_from:retained_from.or(available_from),available_to:available_to.map(|at|at+span),complete,omitted,stored_rows,warnings})
+            Ok(TrafficPage{ip_info:None,rows:out,next_cursor,capture_started,attribution_started,available_from:retained_from.or(available_from),available_to:available_to.map(|at|at+span),complete,omitted,stored_rows,warnings})
         }).await
     }
 }

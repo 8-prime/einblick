@@ -62,10 +62,13 @@ port = 443
         time.sleep(2)
         memory=next((line for line in pathlib.Path(f'/proc/{proc.pid}/status').read_text().splitlines() if line.startswith('VmHWM:')), 'RSS unavailable')
         snapshot=api('/snapshot');assert snapshot['blocking'] and snapshot['totals']['dropped']>0,snapshot
+        assert snapshot['health']['ip_enrichment']['state']=='disabled',snapshot
+        assert not (d/'ip-enrichment').exists(),'mock mode downloaded IP databases'
         assert any(r['applied'] for r in snapshot['rules']),snapshot['rules']
         api('/mode','POST',{'automatic':True,'blocking':True,'acknowledged':True})
         assert api('/snapshot')['health']['telemetry_complete'], 'control command fabricated incomplete telemetry'
         detail=api('/sources/192.0.2.24/traffic?protocol=6&port=443')
+        assert detail['ip_info'] is None,'documentation address received public IP context'
         assert len(detail['rows'])==1 and detail['rows'][0]['port']==443,detail
         assert detail['rows'][0]['passed']>0 and detail['rows'][0]['syns']>0,detail
         assert detail['rows'][0]['application_attribution']['applications'][0]['name']=='demo-web',detail

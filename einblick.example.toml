@@ -20,6 +20,15 @@ ring_bytes = 1048576
 # Protect your actual administrator / VPN address before enabling automatic bans.
 management_allowlist = []
 
+[ip_enrichment]
+# Public DB-IP Lite country/ASN downloads; no account or API token required.
+# Enabled by default for live capture. Mock mode never downloads databases.
+enabled = true
+# Empty stores MMDB files in ip-enrichment/ beside the history database.
+directory = ""
+# Check daily for monthly releases; keep cached data when updates fail.
+check_seconds = 86400
+
 [applications]
 enabled = true
 proc_root = "/host/proc"

@@ -1,5 +1,28 @@
 # Implementation validation — 2026-10-12
 
+## DB-IP Lite enrichment — 2026-10-13
+
+- Added local country/ASN context to live source summaries and the source inspector,
+  with independent database freshness/error status and DB-IP attribution in the UI.
+  Downloads are enabled by default for live capture and disabled in mock mode.
+- Deterministic tests cover IPv4/IPv6 and mapped IPv4, reserved/private addresses,
+  untracked-IP API responses, invalid gzip/MMDB/type/build-month rejection, atomic
+  replacement, cached restart, current-month download skipping, and a real local
+  HTTP current-404/previous-month fallback followed by a corrupt update.
+- Workspace tests passed: **75 tests**, excluding two privileged kernel checks,
+  the manual SQLite resource check, and two provider-dependent enrichment checks.
+  Format, strict Clippy, Svelte check (zero errors/warnings), frontend production
+  build, and the updated HTTP smoke test passed. Mock mode created no database
+  download directory and kept documentation addresses unenriched.
+- Both provider-dependent checks were run separately and passed: real downloaded
+  October 2026 files validated and returned IPv4/IPv6 country/ASN data; the running
+  background updater downloaded both files over HTTPS and restored both after a
+  simulated restart. Validation accepts DB-IP's ASN compatibility header.
+- XDP code/ABI and detection/rule behavior were unchanged; the privileged kernel
+  harness was not rerun. Browser automation surfaces were unavailable, so frontend
+  verification comprises compiler/build and embedded HTTP checks. No deployment
+  or long-running resource/throughput measurement was performed.
+
 ## NAT container attribution — 2026-10-13
 
 - The collector now joins read-only host conntrack dumps with optional Docker

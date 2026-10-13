@@ -56,6 +56,30 @@ pub struct Source {
     pub syns: u64,
     #[serde(default)]
     pub generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_info: Option<IpInfo>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IpInfo {
+    pub country_code: Option<String>,
+    pub country: Option<String>,
+    pub asn: Option<u32>,
+    pub organization: Option<String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IpDatabaseHealth {
+    pub release: Option<String>,
+    pub build_at: Option<i64>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct IpEnrichmentHealth {
+    pub enabled: bool,
+    pub state: String,
+    pub country: IpDatabaseHealth,
+    pub asn: IpDatabaseHealth,
+    pub last_check: Option<i64>,
+    pub last_error: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Port {
@@ -97,6 +121,8 @@ impl Rule {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Health {
+    #[serde(default)]
+    pub ip_enrichment: IpEnrichmentHealth,
     #[serde(default)]
     pub applications: crate::ApplicationHealth,
     pub backend: String,

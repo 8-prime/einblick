@@ -69,6 +69,7 @@ pub struct Monitor {
     detail_storage_ok: bool,
     evidence_gap: bool,
     pub applications: crate::applications::Reader,
+    pub ip_enrichment: crate::ip_enrichment::Enrichment,
     application_bytes: usize,
 }
 impl Monitor {
@@ -139,6 +140,7 @@ impl Monitor {
             detail_storage_ok: true,
             evidence_gap: false,
             applications,
+            ip_enrichment: crate::ip_enrichment::Enrichment::default(),
             application_bytes: 0,
         };
         monitor.publish(Totals::default(), false).await;
@@ -449,6 +451,7 @@ impl Monitor {
                 bytes: s.bytes.saturating_sub(old.map_or(0, |v| v.bytes)),
                 syns: s.syns.saturating_sub(old.map_or(0, |v| v.syns)),
                 generation: s.generation,
+                ip_info: None,
             };
             rates.push((s.ip, delta.packets, delta.syns));
             delta_sources.push(delta);
@@ -625,6 +628,9 @@ impl Monitor {
         let mut sources = self.sources.values().cloned().collect::<Vec<_>>();
         sources.sort_by_key(|s| std::cmp::Reverse(s.packets));
         sources.truncate(100);
+        for source in &mut sources {
+            source.ip_info = self.ip_enrichment.lookup(source.ip);
+        }
         let mut ports = self
             .ports
             .iter()
@@ -650,6 +656,7 @@ impl Monitor {
             automatic: self.automatic,
             blocking: self.blocking,
             health: Health {
+                ip_enrichment: self.ip_enrichment.health(),
                 applications: self.applications.health(),
                 backend,
                 attachments,

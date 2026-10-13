@@ -36,6 +36,7 @@ pub struct App {
     pub auth: Arc<Auth>,
     pub snapshot: Arc<RwLock<Snapshot>>,
     pub live_traffic: Arc<RwLock<LiveTraffic>>,
+    pub ip_enrichment: crate::ip_enrichment::Enrichment,
     pub commands: mpsc::Sender<Command>,
     pub updates: broadcast::Sender<Snapshot>,
     pub shutdown: broadcast::Sender<()>,
@@ -278,7 +279,9 @@ async fn source_traffic(
         ));
     }
     let live = app.live_traffic.read().await.for_query(&query);
-    Ok(Json(app.db.source_traffic(query, live).await?))
+    let mut page = app.db.source_traffic(query, live).await?;
+    page.ip_info = app.ip_enrichment.lookup(ip);
+    Ok(Json(page))
 }
 async fn events(
     State(app): State<App>,
@@ -427,11 +430,51 @@ mod tests {
             auth: Arc::new(Auth::new("test password long enough").unwrap()),
             snapshot: Arc::new(RwLock::new(Snapshot::default())),
             live_traffic: Arc::new(RwLock::new(LiveTraffic::default())),
+            ip_enrichment: crate::ip_enrichment::Enrichment::default(),
             commands: tx,
             updates,
             shutdown: broadcast::channel(1).0,
         }
     }
+    #[tokio::test]
+    async fn source_inspector_enriches_untracked_ips_and_preserves_traffic() {
+        let mut app = app();
+        app.ip_enrichment = crate::ip_enrichment::tests::fixture_enrichment();
+        let (session, _) = app
+            .auth
+            .login(
+                "127.0.0.1".parse().unwrap(),
+                "test password long enough".into(),
+            )
+            .await
+            .unwrap();
+        let router = router(app);
+        for ip in ["8.8.8.8", "2001:4860:4860::8888", "192.168.1.1"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/sources/{ip}/traffic"))
+                        .header(header::COOKIE, format!("einblick_session={session}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert!(body["rows"].as_array().unwrap().is_empty());
+            if ip == "192.168.1.1" {
+                assert!(body["ip_info"].is_null());
+            } else {
+                assert_eq!(body["ip_info"]["country_code"], "RO");
+                assert_eq!(body["ip_info"]["asn"], 64512);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn auth_origin_csrf_and_logout() {
         let app = app();

@@ -220,6 +220,48 @@ map capacities even when the container has a two-CPU quota. Compose caps total
 container memory at 320 MiB to accommodate both budgets. Database disk usage
 has retention limits but no fixed byte quota.
 
+## IP country and network context
+
+Live deployments automatically download the free [DB-IP Lite country and ASN
+databases](https://db-ip.com/db/lite.php), without an account or API token. Overview,
+Traffic, and the IP inspector show approximate country, ASN, and network organization.
+The inspector can enrich a public address even when no traffic history exists.
+Health shows each database's monthly release/build date, last update check, and
+download errors. This context never triggers or changes firewall rules.
+
+Downloads run in the background over HTTPS while capture continues. Files persist
+in `ip-enrichment/` beside the SQLite database (`/data/ip-enrichment/` in the example
+deployment). Einblick reads MMDB files directly; there is no SQLite import or
+per-IP request to DB-IP. A daily check downloads a new monthly release when needed.
+If the current release returns 404, it tries the previous month. Downloads have
+timeouts and size limits; gzip/MMDB contents, database type, IPv6 support and build
+month are validated before each file is replaced atomically. Failed updates retain
+the previous valid data and are retried at the next check. Partial country/ASN
+availability and older releases are visible in Health.
+
+Optional configuration (defaults shown):
+
+```toml
+[ip_enrichment]
+enabled = true
+directory = "" # Empty: beside the history database; or set an explicit directory.
+check_seconds = 86400 # Between one hour and seven days.
+```
+
+Set `enabled = false` to turn off downloads and lookups. Mock mode always disables
+enrichment, including downloads. Outbound DNS and HTTPS to `download.db-ip.com`
+are needed to seed/update the databases; cached data works offline. The runtime
+image includes TLS CA certificates. DB-IP Lite data is licensed under
+[CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); dashboard pages using it
+link back to DB-IP as required.
+
+These are current mappings, including when inspecting historical traffic; they
+are not historical location evidence. Unmapped, private, local and documentation
+addresses show unavailable context. Country is approximate and does not identify
+the person behind a connection. Lite data has reduced coverage/accuracy compared
+with DB-IP's commercial datasets. Country and network identity do not establish
+malicious intent; use observed traffic and service logs when deciding to ban.
+
 ## Develop and validate
 
 Use pnpm, not npm, for the frontend. The pinned version is in its package manifest.
