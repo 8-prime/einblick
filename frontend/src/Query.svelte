@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import IpContext from './IpContext.svelte';
   import { formatNumber, formatBytes } from './analytics.js';
-  import { localDate, queryHash } from './query.js';
+  import { localDate, queryHash, addressFilterError } from './query.js';
   export let api;
   export let initial = {};
   export let onSource;
@@ -18,6 +18,8 @@
     const id = ++request;
     loading = true; error = '';
     if (!more) {
+      const addressError = addressFilterError({ source, destination });
+      if (addressError) {error = addressError; loading = false; return;}
       const end = range === 'custom' ? Math.floor(new Date(to).getTime() / 1000) : Math.floor(Date.now() / 1000);
       const start = range === 'custom' ? Math.floor(new Date(from).getTime() / 1000) : end - Number(range);
       if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || end - start > 7776000) {error = 'Choose a valid time range of up to 90 days.'; loading = false; return;}
@@ -49,11 +51,11 @@
     <datalist id="query-countries"><option value="CN">China</option><option value="DE">Germany</option><option value="US">United States</option><option value="unknown">Country unavailable</option></datalist>
     <label>ISP / network<input bind:value={organization} placeholder="Organization contains…" maxlength="200"></label>
     <label>ASN<input type="number" min="0" max="4294967295" bind:value={asn} placeholder="e.g. 4134"></label>
-    <label>Source IP<input bind:value={source} placeholder="IPv4 or IPv6"></label>
-    <label>Target IP<input bind:value={destination} placeholder="IPv4 or IPv6"></label>
+    <label>Source IP<input bind:value={source} placeholder="e.g. 192.0.2.10 or 2001:db8::1" spellcheck="false"></label>
+    <label>Destination IP<input bind:value={destination} placeholder="e.g. 192.0.2.1 or 2001:db8::2" spellcheck="false"></label>
     <label>Interface<input bind:value={iface} placeholder="e.g. eth0" maxlength="128"></label>
     <label>Protocol<select bind:value={protocol}><option value="">All protocols</option><option value="6">TCP</option><option value="17">UDP</option><option value="1">ICMP</option><option value="58">ICMPv6</option>{#if protocol !== '' && !['6','17','1','58'].includes(String(protocol))}<option value={protocol}>IP {protocol}</option>{/if}</select></label>
-    <label>Target port<input type="number" min="0" max="65535" bind:value={port} placeholder="All ports"></label>
+    <label>Destination port<input type="number" min="0" max="65535" bind:value={port} placeholder="e.g. 22 or 443"></label>
     <label>Source port (sample)<input type="number" min="0" max="65535" bind:value={source_port} placeholder="All ports"></label>
     <label>Time range<select bind:value={range}><option value="3600">Last hour</option><option value="86400">Last 24 hours</option><option value="604800">Last 7 days</option><option value="2592000">Last 30 days</option><option value="7776000">Last 90 days</option><option value="custom">Custom range</option></select></label>
     {#if range === 'custom'}<label>From (local time)<input type="datetime-local" step="1" required bind:value={from}></label><label>To (local time)<input type="datetime-local" step="1" required bind:value={to}></label>{/if}

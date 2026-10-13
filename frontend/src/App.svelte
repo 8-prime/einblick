@@ -4,6 +4,8 @@
   import Analytics from './Analytics.svelte';
   import Query from './Query.svelte';
   import { queryHash } from './query.js';
+  import { readApiResponse } from './api.js';
+  import { matchingRules, networkContains, ruleIsActive, ruleStatus } from './firewall.js';
   import CountrySummary from './CountrySummary.svelte';
   let csrf = '', password = '', loggedIn = false, error = '', busy = false;
   let page = 'Overview', snapshot = null, history = [], audit = [], stream;
@@ -39,7 +41,7 @@
   };
   async function api(path, method = 'GET', data) {
     const response = await fetch(`/api/v1${path}`, { method, headers: {'Content-Type':'application/json', ...(csrf ? {'X-CSRF-Token':csrf} : {})}, ...(data !== undefined ? {body:JSON.stringify(data)} : {}) });
-    const result = response.status === 204 ? null : await response.json();
+    const result = await readApiResponse(response);
     if (!response.ok) { if (response.status === 401 && path !== '/auth/login') {loggedIn=false;stream?.close();} throw new Error(result?.error || `Request failed (${response.status})`); }
     return result;
   }
@@ -86,11 +88,12 @@
     if(!error){network='';reason='';}
   }
   async function openSourceBan() {
+    if(sourceHasBan)return;
     banOpen=true;banError='';banNotice='';
     await tick();banReasonInput?.focus();
   }
   async function addSourceBan() {
-    if(busy||!selectedIP||!detail)return;
+    if(busy||!selectedIP||!detail||sourceHasBan)return;
     if(!banReason.trim()){banError='Enter a reason for this ban.';return;}
     const source=selectedIP, selection=sourceSelection;
     busy=true;banError='';banNotice='';
@@ -100,6 +103,11 @@
       try {snapshot=await api('/snapshot');}catch(e){error=e.message;}
     }catch(e){if(selection===sourceSelection)banError=e.message;else error=e.message;}finally{busy=false;}
   }
+  $: sourceRules=matchingRules(snapshot?.rules||[],selectedIP);
+  $: sourceManagement=management.filter(network=>networkContains(network,selectedIP));
+  $: sourceHasBan=sourceRules.some(rule=>rule.kind==='block'&&ruleIsActive(rule,snapshot?.at||0));
+  $: sourceAllowlisted=sourceManagement.length>0||sourceRules.some(rule=>rule.kind==='allow'&&ruleIsActive(rule,snapshot?.at||0));
+  $: if(sourceHasBan&&banOpen){banOpen=false;banReason='';banError='';}
   $: chartMax=Math.max(1,...history.map(h=>h.totals.packets));
   $: chartPoints=history.map((h,i)=>`${history.length<2?0:i/(history.length-1)*1000},${150-h.totals.packets/chartMax*140}`).join(' ');
   $: other=Math.max(0,(snapshot?.session_totals?.packets ?? snapshot?.totals.packets ?? 0)-(snapshot?.sources||[]).reduce((n,s)=>n+s.packets,0));
@@ -135,7 +143,15 @@
           <div class="panel-title"><h2>Inspect a source IP</h2><form class="ip-lookup" onsubmit={e=>{e.preventDefault();showSource(lookupIP);}}><label class="sr-only" for="ip-lookup">Source IP address</label><input id="ip-lookup" bind:value={lookupIP} placeholder="IPv4 or IPv6 address" required><button disabled={detailBusy}>Inspect →</button></form></div>
           {#if selectedIP}
             {#if snapshot.health.applications && !snapshot.health.applications.enabled}<div class="notice amber detail-message">Automatic application discovery is disabled. New traffic can only receive configured service labels. <button class="text" onclick={()=>navigate('Health')}>View health →</button></div>{/if}
-            <div class="detail-toolbar"><div><strong class="mono">{selectedIP}</strong><IpContext info={detail?.ip_info}/><small>Ingress before host firewall/NAT · passed means passed by Einblick.</small></div><div class="filters"><label>Range<select bind:value={detailRange} onchange={()=>loadSource()}><option value="3600">Last hour</option><option value="86400">24 hours</option><option value="604800">7 days</option><option value="7776000">90 days</option></select></label><label>Protocol<select bind:value={detailProtocol} onchange={()=>loadSource()}><option value="">All</option><option value="6">TCP</option><option value="17">UDP</option><option value="1">ICMP</option><option value="58">ICMPv6</option></select></label><label>Destination port<input type="number" min="0" max="65535" bind:value={detailPort} onchange={()=>loadSource()} placeholder="All"></label><button disabled={detailBusy} onclick={()=>loadSource()}>Refresh</button><button class="danger" disabled={busy||detailBusy||!detail||banOpen} aria-expanded={banOpen} aria-controls="source-ban-form" onclick={openSourceBan}>Ban IP</button></div></div>
+            <div class="detail-toolbar"><div><strong class="mono">{selectedIP}</strong><IpContext info={detail?.ip_info}/><small>Ingress before host firewall/NAT · passed means passed by Einblick.</small></div><div class="filters"><label>Range<select bind:value={detailRange} onchange={()=>loadSource()}><option value="3600">Last hour</option><option value="86400">24 hours</option><option value="604800">7 days</option><option value="7776000">90 days</option></select></label><label>Protocol<select bind:value={detailProtocol} onchange={()=>loadSource()}><option value="">All</option><option value="6">TCP</option><option value="17">UDP</option><option value="1">ICMP</option><option value="58">ICMPv6</option></select></label><label>Destination port<input type="number" min="0" max="65535" bind:value={detailPort} onchange={()=>loadSource()} placeholder="All"></label><button disabled={detailBusy} onclick={()=>loadSource()}>Refresh</button><button class="danger" disabled={busy||detailBusy||!detail||banOpen||sourceHasBan} title={sourceHasBan?'A ban rule already covers this IP. Manage it on the Firewall page.':''} aria-expanded={banOpen} aria-controls="source-ban-form" onclick={openSourceBan}>{sourceHasBan?'Ban exists':'Ban IP'}</button></div></div>
+            {#if sourceRules.length||sourceManagement.length}
+              <div class="source-rules">
+                <div class="panel-title"><h2>Firewall rules for this IP</h2><button class="text" onclick={()=>navigate('Firewall')}>Manage rules →</button></div>
+                <p class="detail-message rule-summary" role="status">{sourceHasBan?'A ban rule already covers this IP.':'No active ban for this IP.'} {#if sourceAllowlisted}This IP is allowlisted; allowlist rules take precedence over bans.{:else if sourceHasBan&&!snapshot.blocking}Blocking is disabled. Enable it on the Firewall page.{/if}</p>
+                {#if sourceManagement.length}<p class="detail-message rule-summary">Protected management allowlist: <span class="mono">{sourceManagement.join(', ')}</span></p>{/if}
+                {#if sourceRules.length}<div class="table-scroll"><table><thead><tr><th>Network</th><th>Action</th><th>Reason</th><th>Expires</th><th>Status</th></tr></thead><tbody>{#each sourceRules as rule (rule.id)}<tr><td class="mono">{rule.network}</td><td><span class="tag" class:amber={rule.kind==='block'}>{rule.kind}</span></td><td>{rule.reason}<small class="actor">{rule.actor}</small></td><td>{rule.expires==null?'Permanent':time(rule.expires)}</td><td>{ruleStatus(rule,snapshot.at)}{#if rule.error&&ruleIsActive(rule,snapshot.at)}<small class="actor error">{rule.error}</small>{/if}</td></tr>{/each}</tbody></table></div>{/if}
+              </div>
+            {/if}
             {#if banOpen}
               <form id="source-ban-form" class="source-ban-form" onsubmit={e=>{e.preventDefault();addSourceBan();}}>
                 <label>IP address<input class="mono" value={selectedIP} readonly></label>
@@ -184,6 +200,7 @@
 {/if}
 
 <style>
+  .source-rules{border-block:1px solid #edf1f3}.rule-summary{font-size:12px}.source-rules td{vertical-align:top}.source-rules td:nth-child(3){overflow-wrap:anywhere;min-width:180px;max-width:320px}.source-rules .error{max-width:240px;overflow-wrap:anywhere}
   .source-ban-form{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1fr);gap:16px;padding:20px 24px;background:#fbfcfc;border-block:1px solid #edf1f3}.source-ban-form input,.source-ban-form select{width:100%}.ban-reason,.ban-context,.ban-actions{grid-column:1/-1}.ban-context{margin:0;font-size:11px}.ban-actions{display:flex;gap:8px;flex-wrap:wrap}
   @media(max-width:700px){.source-ban-form{grid-template-columns:1fr;padding:18px}.ip-detail>.panel-title{flex-wrap:wrap}.ip-detail .ip-lookup{width:100%}.ip-detail .ip-lookup input{flex:1;width:auto}}
   .application-cell{min-width:190px;max-width:290px;white-space:normal}.application-evidence{margin-bottom:8px}.application-evidence summary{cursor:pointer;overflow-wrap:anywhere}.application-reason{color:#996223}.application-evidence .actor{overflow-wrap:anywhere}
