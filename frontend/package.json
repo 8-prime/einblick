@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
-    "check": "svelte-check --fail-on-warnings"
+    "check": "svelte-check --fail-on-warnings",
+    "test": "node --test src/*.test.js"
   },
   "dependencies": {
     "svelte": "^5.0.0"

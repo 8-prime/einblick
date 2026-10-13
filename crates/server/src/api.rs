@@ -100,6 +100,7 @@ pub fn router(app: App) -> Router {
         .route("/snapshot", get(snapshot))
         .route("/stream", get(stream))
         .route("/history", get(history))
+        .route("/analytics", get(analytics))
         .route("/sources/{ip}/traffic", get(source_traffic))
         .route("/events", get(events))
         .route("/rules", get(rules).post(add_rule))
@@ -234,6 +235,42 @@ struct EventsQuery {
     limit: Option<u32>,
     before: Option<i64>,
     ip: Option<IpAddr>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AnalyticsQuery {
+    from: Option<i64>,
+    to: Option<i64>,
+}
+async fn analytics(
+    State(app): State<App>,
+    Query(q): Query<AnalyticsQuery>,
+) -> Result<Json<crate::analytics::Summary>, ApiError> {
+    let to = q.to.unwrap_or_else(unix_now);
+    let from = q.from.unwrap_or(to - 86400);
+    if from < 0 || to < from || to - from > 30 * 86400 {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "analytics requires a nonnegative range of at most 30 days".into(),
+        ));
+    }
+    // Counts include whole overlapping hours, including the latest persisted
+    // partial hour. Minute and hourly history are never combined.
+    let from = from / 3600 * 3600;
+    let to = to / 3600 * 3600;
+    let enrichment = app.ip_enrichment.clone();
+    let builder = app
+        .db
+        .fold_hourly_history(
+            from,
+            to,
+            crate::analytics::Builder::new(from, to),
+            move |builder, bucket| {
+                builder.add(bucket, |ip| enrichment.lookup(ip));
+            },
+        )
+        .await?;
+    Ok(Json(builder.finish()))
 }
 #[derive(Deserialize)]
 struct SourceTrafficQuery {
@@ -435,6 +472,109 @@ mod tests {
             updates,
             shutdown: broadcast::channel(1).0,
         }
+    }
+    #[tokio::test]
+    async fn analytics_auth_ranges_and_current_enrichment() {
+        let mut app = app();
+        app.ip_enrichment = crate::ip_enrichment::tests::fixture_enrichment();
+        let at = unix_now() / 3600 * 3600;
+        app.db
+            .aggregate(
+                Aggregate {
+                    at,
+                    totals: Totals {
+                        packets: 100,
+                        bytes: 1000,
+                        passed: 95,
+                        dropped: 5,
+                        ..Default::default()
+                    },
+                    sources: vec![Source {
+                        ip: "8.8.8.8".parse().unwrap(),
+                        packets: 70,
+                        bytes: 700,
+                        syns: 1,
+                        generation: 0,
+                        ip_info: None,
+                    }],
+                    ports: vec![Port {
+                        protocol: 6,
+                        port: 443,
+                        packets: 100,
+                    }],
+                    complete: true,
+                },
+                app.config.retention.clone(),
+            )
+            .await
+            .unwrap();
+        let (session, _) = app
+            .auth
+            .login(
+                "127.0.0.1".parse().unwrap(),
+                "test password long enough".into(),
+            )
+            .await
+            .unwrap();
+        let router = router(app);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/analytics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for path in [
+            "/api/v1/analytics?from=-1",
+            "/api/v1/analytics?from=10&to=9",
+            "/api/v1/analytics?from=0&to=2678400",
+            "/api/v1/analytics?resolution=minute",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .header(header::COOKIE, format!("einblick_session={session}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path}");
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/v1/analytics?from={at}&to={at}"))
+                    .header(header::COOKIE, format!("einblick_session={session}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(body["totals"]["packets"], 100);
+        assert_eq!(body["country_mapped"]["packets"], 70);
+        let countries = body["countries"].as_array().unwrap();
+        assert!(
+            countries
+                .iter()
+                .any(|r| r["key"] == "RO" && r["packets"] == 70)
+        );
+        assert!(
+            countries
+                .iter()
+                .any(|r| r["key"] == "untracked" && r["packets"] == 30)
+        );
+        assert_eq!(body["timeline"].as_array().unwrap().len(), 1);
     }
     #[tokio::test]
     async fn source_inspector_enriches_untracked_ips_and_preserves_traffic() {

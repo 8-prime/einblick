@@ -1,5 +1,23 @@
 # Implementation validation — 2026-10-12
 
+## Traffic analytics — 2026-10-13
+
+- Added an Overview country summary and Analytics country/network rankings by
+  packets or bytes, hourly observed/passed/blocked timeline with data gaps, protocol
+  mix, and TCP/UDP destination-port rankings. Shared ranges are 24 hours, seven
+  days, and 30 days. Coverage distinguishes unavailable mappings, untracked source
+  and transport detail, incomplete evidence, and missing retained hours.
+- The authenticated summary endpoint folds hourly history on the read worker.
+  A regression with over 4 MiB of raw buckets verified that the full range is
+  summarized even when the raw history response truncates. Other regressions cover
+  range validation, current country lookup, port/protocol distinctions, both metric
+  leaders, tail accounting, and process-local Overview denominators.
+- All 79 workspace tests passed (five existing privileged/manual/provider tests
+  ignored). The two frontend aggregation tests, strict Clippy, Svelte checks,
+  production frontend build, server build, and authenticated HTTP smoke checks
+  passed. Browser surfaces and a browser executable were unavailable; visual
+  browser inspection was not performed. No deployment or kernel changes were made.
+
 ## DB-IP Lite enrichment — 2026-10-13
 
 - Added local country/ASN context to live source summaries and the source inspector,

@@ -1,3 +1,4 @@
+mod analytics;
 mod api;
 mod applications;
 mod auth;

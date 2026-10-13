@@ -51,6 +51,7 @@ port = 443
         proc=subprocess.Popen([str(BINARY),'--config',str(config)],cwd=ROOT,stdout=subprocess.DEVNULL)
         wait();assert request('/')[0]==200
         assert request('/api/v1/snapshot')[0]==401
+        assert request('/api/v1/analytics')[0]==401
         assert request('/api/v1/sources/192.0.2.24/traffic')[0]==401
         cookie,csrf=login()
         def api(path,method='GET',data=None):
@@ -117,6 +118,11 @@ port = 443
         assert snapshot['session_totals']['packets']<snapshot['totals']['packets'],snapshot
         assert snapshot['automatic'] and snapshot['blocking'] and any(r['applied'] for r in snapshot['rules'])
         history=api('/history?from=0');assert history and sum(h['totals']['packets'] for h in history)>0
+        summary=api('/analytics')
+        assert summary['totals']['packets']>0 and summary['timeline'],summary
+        for group in ['countries','networks','protocols','ports']:
+            assert sum(row['packets'] for row in summary[group])==summary['totals']['packets'],(group,summary)
+        assert summary['country_mapped']['packets']==0,'mock IPs received country mappings'
         restored=api('/sources/192.0.2.24/traffic?port=443')
         assert restored['rows'][0]['packets']>=previous_detail,restored
         names={app['name'] for app in restored['rows'][0]['application_attribution']['applications']}

@@ -308,6 +308,27 @@ impl Database {
     pub async fn overview_totals(&self) -> Result<Totals> {
         self.read(|c| overview_totals(c)).await
     }
+    /// Fold at most 31 days of hourly history one bucket at a time. Unlike the
+    /// raw history endpoint, compact summaries need not truncate at 4 MiB.
+    pub async fn fold_hourly_history<T: Send + 'static>(
+        &self,
+        from: i64,
+        to: i64,
+        mut summary: T,
+        mut fold: impl FnMut(&mut T, Aggregate) + Send + 'static,
+    ) -> Result<T> {
+        ensure!(
+            from >= 0 && to >= from && to - from <= 31 * 86400,
+            "invalid analytics range"
+        );
+        self.read(move |c| {
+            let mut statement = c.prepare("SELECT data FROM aggregates WHERE resolution='hour' AND at>=? AND at<=? ORDER BY at")?;
+            for row in statement.query_map(params![from, to], |r| r.get::<_, String>(0))? {
+                fold(&mut summary, serde_json::from_str(&row?)?);
+            }
+            Ok(summary)
+        }).await
+    }
     pub async fn history(&self, resolution: String, from: i64, to: i64) -> Result<Vec<Aggregate>> {
         self.read(move|c| {
         ensure!(resolution=="minute"||resolution=="hour","resolution must be minute or hour");
@@ -320,6 +341,55 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn compact_history_reads_full_range_beyond_raw_response_budget() {
+        let db = Database::open(":memory:").unwrap();
+        db.call(|c| {
+            let transaction = c.transaction()?;
+            let mut bucket = Aggregate {
+                at: 0,
+                totals: Totals {
+                    packets: 2048,
+                    ..Default::default()
+                },
+                sources: vec![],
+                ports: (1..=2048)
+                    .map(|port| crate::Port {
+                        protocol: 6,
+                        port,
+                        packets: 1,
+                    })
+                    .collect(),
+                complete: true,
+            };
+            for hour in 0..100 {
+                bucket.at = hour * 3600;
+                transaction.execute(
+                    "INSERT INTO aggregates(resolution,at,data) VALUES('hour',?,?)",
+                    params![bucket.at, serde_json::to_string(&bucket)?],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert!(db.history("hour".into(), 0, 99 * 3600).await.unwrap().len() < 100);
+        let (buckets, packets) = db
+            .fold_hourly_history(0, 99 * 3600, (0, 0u64), |summary, bucket| {
+                summary.0 += 1;
+                summary.1 += bucket.totals.packets;
+            })
+            .await
+            .unwrap();
+        assert_eq!(buckets, 100);
+        assert_eq!(packets, 204800);
+        assert!(
+            db.fold_hourly_history(0, 32 * 86400, (), |_, _| {})
+                .await
+                .is_err()
+        );
+    }
     #[tokio::test]
     async fn persistence_rules_audit_and_retention() {
         let db = Database::open(":memory:").unwrap();

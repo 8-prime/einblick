@@ -222,6 +222,15 @@ has retention limits but no fixed byte quota.
 
 ## IP country and network context
 
+Overview includes a compact traffic-by-country ranking for the current process.
+**Analytics** summarizes retained hourly traffic for the last 24 hours, seven days,
+or 30 days: country and ASN/network rankings by packets or bytes, an observed /
+passed / blocked timeline, protocol mix, and top TCP/UDP destination ports.
+It refreshes every minute and shows country coverage, incomplete evidence, and
+hours without retained history. Country/network rankings use bounded top-100
+hourly source summaries; unavailable mappings and other/untracked sources are
+explicit. The current database maps historical IPs, so geography is approximate.
+
 Live deployments automatically download the free [DB-IP Lite country and ASN
 databases](https://db-ip.com/db/lite.php), without an account or API token. Overview,
 Traffic, and the IP inspector show approximate country, ASN, and network organization.

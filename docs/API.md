@@ -17,6 +17,7 @@ no bearer API tokens or multiple roles are included in this MVP.
 | POST | `/mode` | `{ "automatic":false, "blocking":true, "acknowledged":false }` |
 | POST | `/emergency-disable` | No body; disable kernel blocking before persistence |
 | GET | `/history` | `resolution=minute\|hour`, `from`, `to` Unix seconds; up to 1,000 newest buckets, ascending; 4 MiB data limit |
+| GET | `/analytics` | Optional `from`, `to` Unix seconds; default last 24 hours, maximum 30 days; compact hourly traffic summary |
 | GET | `/events` | `limit` (default 100, max 200), `before` exclusive event ID cursor, optional exact source `ip`; newest first; 4 MiB data limit |
 | GET | `/sources/{ip}/traffic` | Source association detail; parameters and response below |
 
@@ -62,6 +63,35 @@ Missing port/association detail alone does not suspend detectors with complete
 inputs. Storage/enforcement failures continue to suspend new automatic bans.
 Commands preserve the latest telemetry health. Session metadata also includes
 `detail_limits`: configured `minute_days`, `hourly_days`, and `row_limit`.
+
+## Traffic analytics
+
+`/analytics` summarizes whole overlapping hourly buckets, including persisted
+minutes in the latest partial hour. It consumes one resolution only, reading each
+bucket on the history worker without the raw `/history` endpoint's 4 MiB cutoff.
+It excludes the uncommitted minute and does not change collection or retention.
+
+The response has aligned `from`/`to`, `totals`, ascending `timeline` (hour `at`,
+`packets`, `bytes`, `passed`, `dropped`, `complete`), and `countries`, `networks`,
+`protocols`, `ports` rankings. Each ranking has `key`, `label`, `packets`, `bytes`.
+Protocol and port rankings contain packet counts only; `bytes` is zero.
+Country/network groups use current DB-IP mappings of the top 100 retained sources
+per hour. `unknown` means retained sources without a mapping; `untracked` means
+the difference between aggregate totals and retained source counts.
+`country_mapped` and `source_tracked` contain packet/byte coverage counts.
+Network rankings retain the ten packet leaders and ten byte leaders plus explicit
+unknown/untracked groups; the remaining traffic is grouped as `other`.
+Ports distinguish TCP and UDP and retain ten packet leaders plus `other`, `none`
+(unparsed/no destination port, including legacy port zero), and `untracked`.
+Protocol rankings include all retained protocols plus untracked detail.
+
+`incomplete_buckets` counts retained hours with incomplete telemetry;
+`missing_buckets` counts hours without retained buckets in the aligned range.
+Missing hours remain absent from the timeline and must not be interpreted as zero
+traffic. Counts and shares describe observations, not successful connections or
+malicious intent. The dashboard supports 24-hour, seven-day, and 30-day ranges,
+refreshes every minute, and allows packet/byte ranking of countries and networks.
+Overview's compact country ranking uses process-local sources and totals instead.
 
 ## IP enrichment
 
