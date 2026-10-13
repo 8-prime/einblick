@@ -2,6 +2,8 @@
   import { onMount, tick } from 'svelte';
   import IpContext from './IpContext.svelte';
   import Analytics from './Analytics.svelte';
+  import Query from './Query.svelte';
+  import { queryHash } from './query.js';
   import CountrySummary from './CountrySummary.svelte';
   let csrf = '', password = '', loggedIn = false, error = '', busy = false;
   let page = 'Overview', snapshot = null, history = [], audit = [], stream;
@@ -11,7 +13,18 @@
   let detailLimits = {minute_days:7,hourly_days:90,row_limit:1000000};
   let detailPanel, detailPaged = false;
   let detailRange = '86400', detailProtocol = '', detailPort = '', detailTo = 0, detailEvents = [], detailRequest = 0;
-  const pages = ['Overview', 'Traffic', 'Analytics', 'History', 'Detections', 'Firewall', 'Health'];
+  let queryFilters = {}, queryVersion = 0;
+  function readRoute() {
+    const [route, params = ''] = window.location.hash.slice(1).split('?');
+    const target = pages.find(p => p.toLowerCase() === route);
+    if (target === 'Query') {queryFilters = Object.fromEntries(new URLSearchParams(params));queryVersion++;}
+    if (target) navigate(target, false);
+  }
+  function openQuery(filters = {}) {
+    const hash = queryHash(filters);
+    if (window.location.hash === hash) readRoute(); else window.location.hash = hash;
+  }
+  const pages = ['Overview', 'Traffic', 'Analytics', 'Query', 'History', 'Detections', 'Firewall', 'Health'];
   const fmt = (n = 0) => new Intl.NumberFormat('en', { notation: n >= 1000000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(n);
   const bytes = (n = 0) => n >= 1e9 ? `${(n/1e9).toFixed(2)} GB` : n >= 1e6 ? `${(n/1e6).toFixed(1)} MB` : `${(n/1000).toFixed(1)} kB`;
   const time = (s) => s ? new Date(s * 1000).toLocaleString() : '—';
@@ -36,13 +49,14 @@
     stream.addEventListener('session_expired', () => {loggedIn=false;stream.close();});
     stream.onerror=()=>{ if (loggedIn) {error='Live stream interrupted. Reconnecting…';api('/auth/session').catch(e=>error=e.message);} };
     stream.onopen=()=>{if(error.startsWith('Live stream'))error='';};
+    readRoute();
   }
   async function login() {busy=true;error='';try {const s=await api('/auth/login','POST',{password});csrf=s.csrf;password='';await loadSession();}catch(e){error=e.message;}finally{busy=false;}}
   async function logout() {try{await api('/auth/logout','POST');}catch(e){error=e.message;}stream?.close();loggedIn=false;csrf='';}
-  async function navigate(p) {page=p;error='';try{if(p==='History')await loadHistory();if(p==='Detections')audit=await api('/events');}catch(e){error=e.message;}}
+  async function navigate(p, updateRoute = true) {page=p;if(updateRoute)window.history.pushState(null, '', p === 'Query' ? queryHash(queryFilters) : `#${p.toLowerCase()}`);error='';try{if(p==='History')await loadHistory();if(p==='Detections')audit=await api('/events');}catch(e){error=e.message;}}
   async function loadHistory() {const to=Math.floor(Date.now()/1000);history=await api(`/history?resolution=${resolution}&from=${to-Number(range)}&to=${to}`);}
   async function showSource(ip) {
-    selectedIP=ip.trim();lookupIP=selectedIP;page='Traffic';detail=null;detailEvents=[];
+    selectedIP=ip.trim();lookupIP=selectedIP;page='Traffic';window.history.pushState(null, '', '#traffic');detail=null;detailEvents=[];
     const source=selectedIP;
     await tick();detailPanel?.scrollIntoView({behavior:'smooth',block:'start'});
     await loadSource();
@@ -71,7 +85,7 @@
   $: chartMax=Math.max(1,...history.map(h=>h.totals.packets));
   $: chartPoints=history.map((h,i)=>`${history.length<2?0:i/(history.length-1)*1000},${150-h.totals.packets/chartMax*140}`).join(' ');
   $: other=Math.max(0,(snapshot?.session_totals?.packets ?? snapshot?.totals.packets ?? 0)-(snapshot?.sources||[]).reduce((n,s)=>n+s.packets,0));
-  onMount(()=>{loadSession().catch(()=>{});const refresh=setInterval(()=>{if(loggedIn&&page==='Traffic'&&selectedIP&&!detailBusy&&!detailPaged&&!detail?.next_cursor)loadSource();},5000);return()=>{stream?.close();clearInterval(refresh);};});
+  onMount(()=>{window.addEventListener('hashchange',readRoute);loadSession().catch(()=>{});const refresh=setInterval(()=>{if(loggedIn&&page==='Traffic'&&selectedIP&&!detailBusy&&!detailPaged&&!detail?.next_cursor)loadSource();},5000);return()=>{stream?.close();clearInterval(refresh);window.removeEventListener('hashchange',readRoute);};});
 </script>
 
 {#if !loggedIn}
@@ -81,8 +95,8 @@
     <div class="login-art" aria-hidden="true"><div class="orbit o1"></div><div class="orbit o2"></div><div class="orbit o3"></div><div class="art-label">VISIBILITY AT THE EDGE</div><div class="art-dot"></div></div>
   </main>
 {:else}
-  <div class="shell"><aside><div class="brand"><span class="mark">e</span> einblick</div><div class="eyebrow side-label">WORKSPACE / THIS SERVER</div><nav>{#each pages as p,i}<button class:active={page===p} onclick={()=>navigate(p)}><span class="nav-icon">{['◈','≋','▥','◷','⚑','⊞','⌁'][i]}</span>{p}{#if p==='Detections'&&snapshot?.detections.length}<span class="count">{snapshot.detections.length}</span>{/if}</button>{/each}</nav><div class="side-bottom"><span class="status-dot"></span> Independently hosted <button onclick={logout}>Sign out ↗</button></div></aside>
-    <main class="content"><header><div><span class="eyebrow">NETWORK / {page.toUpperCase()}</span><h1>{page==='Overview'?'Your network, at a glance.':page==='Firewall'?'Control incoming traffic.':page==='Detections'?'Signals worth investigating.':page==='Analytics'?'Understand your traffic.':page==='History'?'Traffic over time.':page==='Health'?'System health.':'Who’s reaching your server.'}</h1></div><div class="live"><span class="status-dot" class:warning={!snapshot?.health.telemetry_complete}></span>{snapshot?.health.backend.startsWith('mock')?'Demo traffic':'Live ingress'}<small>{time(snapshot?.at)}</small></div></header>
+  <div class="shell"><aside><div class="brand"><span class="mark">e</span> einblick</div><div class="eyebrow side-label">WORKSPACE / THIS SERVER</div><nav>{#each pages as p,i}<button class:active={page===p} onclick={()=>navigate(p)}><span class="nav-icon">{['◈','≋','▥','⌕','◷','⚑','⊞','⌁'][i]}</span>{p}{#if p==='Detections'&&snapshot?.detections.length}<span class="count">{snapshot.detections.length}</span>{/if}</button>{/each}</nav><div class="side-bottom"><span class="status-dot"></span> Independently hosted <button onclick={logout}>Sign out ↗</button></div></aside>
+    <main class="content"><header><div><span class="eyebrow">NETWORK / {page.toUpperCase()}</span><h1>{page==='Overview'?'Your network, at a glance.':page==='Firewall'?'Control incoming traffic.':page==='Detections'?'Signals worth investigating.':page==='Query'?'Find the traffic behind the numbers.':page==='Analytics'?'Understand your traffic.':page==='History'?'Traffic over time.':page==='Health'?'System health.':'Who’s reaching your server.'}</h1></div><div class="live"><span class="status-dot" class:warning={!snapshot?.health.telemetry_complete}></span>{snapshot?.health.backend.startsWith('mock')?'Demo traffic':'Live ingress'}<small>{time(snapshot?.at)}</small></div></header>
     {#if error}<div class="error banner" role="alert">{error}<button onclick={()=>error=''} aria-label="Dismiss error">×</button></div>{/if}
     {#if snapshot?.health.backend.startsWith('mock')}<div class="notice">DEMO MODE <span>Synthetic traffic. Firewall changes are simulated.</span></div>{/if}
     {#if snapshot&&!snapshot.health.telemetry_complete}<div class="notice amber">INCOMPLETE TELEMETRY <span>{snapshot.health.detection_complete?'Detection evidence is complete.':'New automatic bans are suspended.'} {snapshot.health.reasons?.join(' / ')}</span></div>{/if}
@@ -91,12 +105,14 @@
         <div class="cards"><article><span class="eyebrow">OBSERVED PACKETS</span><strong>{fmt(snapshot.totals.packets)}</strong><small>{fmt(snapshot.rate.packets)} packets / latest interval</small><div class="mini-line"></div></article><article><span class="eyebrow">INCOMING VOLUME</span><strong>{bytes(snapshot.totals.bytes)}</strong><small>{bytes(snapshot.rate.bytes)} / latest interval</small><div class="mini-line blue"></div></article><article><span class="eyebrow">BLOCKED PACKETS</span><strong>{fmt(snapshot.totals.dropped)}</strong><small>{fmt(snapshot.totals.passed)} passed</small><div class="mini-line amber-line"></div></article><article><span class="eyebrow">ENFORCEMENT</span><strong class="mode-text">{snapshot.automatic?'Automatic':snapshot.blocking?'Manual':'Observe'}</strong><small>{snapshot.rules.filter(r=>r.applied&&r.kind==='block').length} applied block rules</small><div class="mini-line gray"></div></article></div>
         <div class="grid"><section class="panel"><div class="panel-title"><h2>Top sources</h2><button class="text" onclick={()=>navigate('Traffic')}>View traffic ↗</button></div><table><thead><tr><th>Source</th><th>Packets</th><th>Volume</th></tr></thead><tbody>{#each snapshot.sources.slice(0,8) as s}<tr><td><button class="text mono ip-link" onclick={()=>showSource(s.ip)}>{s.ip}</button><IpContext info={s.ip_info} compact={page==='Overview'}/></td><td>{fmt(s.packets)}</td><td>{bytes(s.bytes)}</td></tr>{/each}{#if !snapshot.sources.length}<tr><td colspan="3" class="empty">Waiting for incoming traffic.</td></tr>{/if}</tbody></table><footer class="panel-foot">Current tracked sources · other / untracked: {fmt(other)} packets</footer></section>
         <section class="panel"><div class="panel-title"><h2>Recent signals</h2><button class="text" onclick={()=>navigate('Detections')}>All events ↗</button></div>{#each [...snapshot.detections].reverse().slice(0,5) as d}<div class="signal"><span class="signal-icon">!</span><div><b>{d.kind.replaceAll('_',' ')}</b><span class="mono">{d.ip}</span><small>{d.evidence}</small></div><small>{new Date(d.at*1000).toLocaleTimeString()}</small></div>{/each}{#if !snapshot.detections.length}<div class="empty roomy"><span class="quiet-icon">◈</span>No recent detections.<small>Thresholds are evaluated as traffic arrives.</small></div>{/if}</section></div>
-        <CountrySummary {snapshot} onExplore={()=>navigate('Analytics')}/>
+        <CountrySummary {snapshot} onExplore={()=>navigate('Analytics')} onQuery={openQuery}/>
         <div class="footnote">Ingress packet metadata · SYNs are attempts, including retransmissions · overview totals persist across restarts; source and port summaries cover this process</div>
       {:else if page==='Analytics'}
-        <Analytics {api}/>
+        <Analytics {api} onQuery={openQuery}/>
+      {:else if page==='Query'}
+        {#key queryVersion}<Query {api} initial={queryFilters} onFilters={filters=>queryFilters=filters} onSource={showSource}/>{/key}
       {:else if page==='Traffic'}
-        <div class="grid"><section class="panel"><div class="panel-title"><h2>Source addresses</h2><span class="tag">TOP 100</span></div><div class="table-scroll"><table><thead><tr><th>Address</th><th>Packets</th><th>Bytes</th><th>SYN attempts</th></tr></thead><tbody>{#each snapshot.sources as s}<tr><td><button class="text mono ip-link" onclick={()=>showSource(s.ip)}>{s.ip}</button><IpContext info={s.ip_info} compact={page==='Overview'}/></td><td>{fmt(s.packets)}</td><td>{bytes(s.bytes)}</td><td>{fmt(s.syns)}</td></tr>{/each}</tbody></table></div><footer class="panel-foot">Other / untracked: {fmt(other)} packets. Source detail is bounded.</footer></section><section class="panel"><div class="panel-title"><h2>Destination ports & protocols</h2></div><div class="table-scroll"><table><thead><tr><th>Protocol</th><th>Port</th><th>Packets</th></tr></thead><tbody>{#each snapshot.ports as p}<tr><td>{protocol(p.protocol)}</td><td class="mono">{p.port||'unparsed / none'}</td><td>{fmt(p.packets)}</td></tr>{/each}</tbody></table></div></section></div>
+        <div class="grid"><section class="panel"><div class="panel-title"><h2>Source addresses</h2><button class="text" onclick={()=>openQuery()}>Query all traffic ↗</button></div><div class="table-scroll"><table><thead><tr><th>Address</th><th>Packets</th><th>Bytes</th><th>SYN attempts</th></tr></thead><tbody>{#each snapshot.sources as s}<tr><td><button class="text mono ip-link" onclick={()=>showSource(s.ip)}>{s.ip}</button><IpContext info={s.ip_info} compact={page==='Overview'}/></td><td>{fmt(s.packets)}</td><td>{bytes(s.bytes)}</td><td>{fmt(s.syns)}</td></tr>{/each}</tbody></table></div><footer class="panel-foot">Other / untracked: {fmt(other)} packets. Source detail is bounded.</footer></section><section class="panel"><div class="panel-title"><h2>Destination ports & protocols</h2></div><div class="table-scroll"><table><thead><tr><th>Protocol</th><th>Port</th><th>Packets</th></tr></thead><tbody>{#each snapshot.ports as p}<tr><td><button class="text" onclick={()=>openQuery({protocol:p.protocol})}>{protocol(p.protocol)} ↗</button></td><td class="mono">{#if p.port}<button class="text mono" onclick={()=>openQuery({protocol:p.protocol,port:p.port})}>{p.port} ↗</button>{:else}unparsed / none{/if}</td><td>{fmt(p.packets)}</td></tr>{/each}</tbody></table></div></section></div>
         <section class="panel ip-detail" bind:this={detailPanel}>
           <div class="panel-title"><h2>Inspect a source IP</h2><form class="ip-lookup" onsubmit={e=>{e.preventDefault();showSource(lookupIP);}}><label class="sr-only" for="ip-lookup">Source IP address</label><input id="ip-lookup" bind:value={lookupIP} placeholder="IPv4 or IPv6 address" required><button disabled={detailBusy}>Inspect →</button></form></div>
           {#if selectedIP}
@@ -133,7 +149,7 @@
         <div class="grid"><section class="panel"><div class="panel-title"><h2>Runtime</h2></div><dl><dt>Backend</dt><dd>{snapshot.health.backend}</dd><dt>Interfaces</dt><dd>{snapshot.health.attachments.join(', ')||'Synthetic input'}</dd><dt>Storage</dt><dd>{snapshot.health.storage_ok?'Healthy':'Failed · automatic bans suspended'}</dd><dt>Enforcement</dt><dd>{snapshot.health.enforcement_ok?'Synchronized':'Failed · reconciliation pending'}</dd><dt>Detection evidence</dt><dd>{snapshot.health.detection_complete?'Complete latest interval':'Incomplete / new automatic bans suspended'}</dd><dt>Traffic detail</dt><dd>{snapshot.health.detail_complete?'Complete latest interval':'Incomplete latest interval'}</dd><dt>Last observation</dt><dd>{time(snapshot.health.last_tick)}</dd><dt>Application discovery</dt><dd>{snapshot.health.applications?.state || "disabled"}<small class="actor">Last scan: {time(snapshot.health.applications?.last_scan)} · {fmt(snapshot.health.applications?.sockets || 0)} sockets · {fmt(snapshot.health.applications?.owned_sockets || 0)} with identified owners · {fmt(snapshot.health.applications?.nat_mappings || 0)} NAT container mappings</small>{#each snapshot.health.applications?.reasons || [] as reason}<small class="actor">{applicationReason(reason)}</small>{/each}{#each snapshot.health.applications?.diagnostics || [] as diagnostic}<small class="actor">{diagnostic}</small>{/each}</dd></dl>{#if snapshot.health.last_error}<div class="error banner">{snapshot.health.last_error}</div>{/if}</section><section class="panel"><div class="panel-title"><h2>Telemetry limits</h2></div><dl><dt>Parsing limitations</dt><dd>{fmt(snapshot.totals.parse_limits)}</dd><dt>SYN event loss</dt><dd>{fmt(snapshot.totals.event_loss)}</dd><dt>Map capacity misses</dt><dd>{fmt(snapshot.totals.map_full)}</dd><dt>Source / port / IP detail misses</dt><dd>{fmt(snapshot.totals.source_misses)} / {fmt(snapshot.totals.port_misses)} / {fmt(snapshot.totals.association_misses)}</dd><dt>Port scan threshold</dt><dd>{thresholds.scan_ports} distinct ports / 60s</dd><dt>SYN flood threshold</dt><dd>{fmt(thresholds.syns_10s)} SYNs / 10s</dd><dt>Packet flood threshold</dt><dd>{fmt(thresholds.flood_pps)} packets/s for 3s</dd></dl></section></div><section class="panel"><div class="panel-title"><h2>IP enrichment</h2><span class="tag">DB-IP LITE</span></div><dl><dt>Status</dt><dd>{enrichmentState(snapshot.health.ip_enrichment?.state)}</dd><dt>Country database</dt><dd>{snapshot.health.ip_enrichment?.country?.release || 'Unavailable'}<small class="actor">Built {time(snapshot.health.ip_enrichment?.country?.build_at)}</small></dd><dt>ASN database</dt><dd>{snapshot.health.ip_enrichment?.asn?.release || 'Unavailable'}<small class="actor">Built {time(snapshot.health.ip_enrichment?.asn?.build_at)}</small></dd><dt>Last update check</dt><dd>{time(snapshot.health.ip_enrichment?.last_check)}</dd></dl>{#if snapshot.health.ip_enrichment?.last_error}<p class="error detail-message">{snapshot.health.ip_enrichment.last_error}</p>{/if}<p class="detail-message footnote">Updates run in the background. Existing data remains available when an update fails. IP context does not affect blocking decisions.</p></section><section class="panel"><div class="panel-title"><h2>Tracking map occupancy</h2></div><table><thead><tr><th>Map</th><th>Collected entries</th><th>Capacity</th></tr></thead><tbody>{#each snapshot.health.maps||[] as map}<tr><td>{map.name}</td><td>{fmt(map.used)}</td><td>{fmt(map.capacity)}</td></tr>{/each}</tbody></table></section><p class="footnote">Unsupported transport headers are passed and counted. Extractable source addresses still participate in rules. XDP detaches when the process exits; active persisted rules restore on restart.</p>
       {/if}
     {/if}
-    {#if snapshot?.health.ip_enrichment?.enabled && ['Overview','Traffic','Analytics','Health'].includes(page)}<p class="footnote">IP Geolocation by <a href="https://db-ip.com" target="_blank" rel="noopener noreferrer">DB-IP</a> · Country {snapshot.health.ip_enrichment.country?.release || 'unavailable'} · ASN {snapshot.health.ip_enrichment.asn?.release || 'unavailable'}. Approximate current IP mapping; country does not identify the person behind a connection.</p>{/if}
+    {#if snapshot?.health.ip_enrichment?.enabled && ['Overview','Traffic','Analytics','Query','Health'].includes(page)}<p class="footnote">IP Geolocation by <a href="https://db-ip.com" target="_blank" rel="noopener noreferrer">DB-IP</a> · Country {snapshot.health.ip_enrichment.country?.release || 'unavailable'} · ASN {snapshot.health.ip_enrichment.asn?.release || 'unavailable'}. Approximate current IP mapping; country does not identify the person behind a connection.</p>{/if}
     </main>
   </div>
 {/if}

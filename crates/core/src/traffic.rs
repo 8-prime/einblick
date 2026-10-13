@@ -39,7 +39,7 @@ pub struct TrafficRecord {
     pub application_attribution: crate::ApplicationAttribution,
 }
 pub type TrafficKey = (IpAddr, IpAddr, String, u8, Option<u16>);
-pub type TrafficCursor = (String, String, u8, i32);
+pub type TrafficCursor = (String, String, String, u8, i32);
 impl TrafficRecord {
     pub fn key(&self) -> TrafficKey {
         (
@@ -52,6 +52,7 @@ impl TrafficRecord {
     }
     pub fn cursor(&self) -> TrafficCursor {
         (
+            self.source.to_string(),
             self.destination.to_string(),
             self.interface.clone(),
             self.protocol,
@@ -83,15 +84,22 @@ pub struct LiveTraffic {
 }
 impl LiveTraffic {
     pub fn for_query(&self, q: &TrafficQuery) -> Self {
+        self.for_query_matching(q, |_| true)
+    }
+    pub fn for_query_matching(
+        &self,
+        q: &TrafficQuery,
+        mut matches_source: impl FnMut(IpAddr) -> bool,
+    ) -> Self {
         let cursor = q.cursor.clone().unwrap_or_default();
         let mut batches = vec![];
         for batch in &self.batches {
             let mut selected = std::collections::BTreeMap::new();
-            for row in batch.rows.iter().filter(|r| {
-                r.source == q.ip
-                    && q.protocol.is_none_or(|p| p == r.protocol)
-                    && q.port.is_none_or(|p| Some(p) == r.port)
-            }) {
+            for row in batch
+                .rows
+                .iter()
+                .filter(|r| q.matches(r) && matches_source(r.source))
+            {
                 let key = row.cursor();
                 if key <= cursor {
                     continue;
@@ -128,7 +136,10 @@ pub struct DetailBatch {
 }
 #[derive(Clone, Debug)]
 pub struct TrafficQuery {
-    pub ip: IpAddr,
+    pub ip: Option<IpAddr>,
+    pub destination: Option<IpAddr>,
+    pub interface: Option<String>,
+    pub source_port: Option<u16>,
     pub resolution: String,
     pub from: i64,
     pub to: i64,
@@ -136,6 +147,21 @@ pub struct TrafficQuery {
     pub port: Option<u16>,
     pub cursor: Option<TrafficCursor>,
     pub limit: usize,
+}
+impl TrafficQuery {
+    pub fn matches(&self, row: &TrafficRecord) -> bool {
+        self.ip.is_none_or(|ip| row.source == ip)
+            && self.destination.is_none_or(|ip| row.destination == ip)
+            && self
+                .interface
+                .as_ref()
+                .is_none_or(|name| &row.interface == name)
+            && self
+                .source_port
+                .is_none_or(|port| row.source_ports.contains(&port))
+            && self.protocol.is_none_or(|p| p == row.protocol)
+            && self.port.is_none_or(|p| Some(p) == row.port)
+    }
 }
 #[derive(Clone, Debug, Serialize)]
 pub struct TrafficPage {

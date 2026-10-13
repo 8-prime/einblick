@@ -102,6 +102,7 @@ pub fn router(app: App) -> Router {
         .route("/history", get(history))
         .route("/analytics", get(analytics))
         .route("/sources/{ip}/traffic", get(source_traffic))
+        .route("/traffic", get(traffic_query))
         .route("/events", get(events))
         .route("/rules", get(rules).post(add_rule))
         .route("/rules/{id}", axum::routing::delete(remove_rule))
@@ -295,18 +296,21 @@ async fn source_traffic(
     }
     let cursor = q
         .cursor
-        .map(|c| serde_json::from_str::<TrafficCursor>(&c))
+        .map(|c| serde_json::from_str::<(String, String, u8, i32)>(&c))
         .transpose()
         .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid cursor".into()))?;
     let now = unix_now();
     let query = TrafficQuery {
-        ip,
+        ip: Some(ip),
+        destination: None,
+        interface: None,
+        source_port: None,
         resolution: q.resolution.unwrap_or("minute".into()),
         from: q.from.unwrap_or(now - 86400),
         to: q.to.unwrap_or(now),
         protocol: q.protocol,
         port: q.port,
-        cursor,
+        cursor: cursor.map(|c| (ip.to_string(), c.0, c.1, c.2, c.3)),
         limit: q.limit.unwrap_or(100),
     };
     if !(1..=500).contains(&query.limit) {
@@ -318,8 +322,126 @@ async fn source_traffic(
     let live = app.live_traffic.read().await.for_query(&query);
     let mut page = app.db.source_traffic(query, live).await?;
     page.ip_info = app.ip_enrichment.lookup(ip);
+    // Preserve the source inspector's existing four-field cursor contract.
+    if let Some(cursor) = &page.next_cursor {
+        let c: TrafficCursor = serde_json::from_str(cursor).map_err(anyhow::Error::from)?;
+        page.next_cursor =
+            Some(serde_json::to_string(&(c.1, c.2, c.3, c.4)).map_err(anyhow::Error::from)?);
+    }
     Ok(Json(page))
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrafficSearch {
+    from: Option<i64>,
+    to: Option<i64>,
+    resolution: Option<String>,
+    source: Option<IpAddr>,
+    destination: Option<IpAddr>,
+    interface: Option<String>,
+    protocol: Option<u8>,
+    port: Option<u16>,
+    source_port: Option<u16>,
+    country: Option<String>,
+    asn: Option<u32>,
+    organization: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+impl TrafficSearch {
+    fn matches_source(&self, info: Option<&IpInfo>) -> bool {
+        self.country.as_ref().is_none_or(|country| {
+            if country == "unknown" {
+                info.and_then(|i| i.country_code.as_ref()).is_none()
+            } else {
+                info.and_then(|i| i.country_code.as_ref())
+                    .is_some_and(|code| code.eq_ignore_ascii_case(country))
+            }
+        }) && self
+            .asn
+            .is_none_or(|asn| info.and_then(|i| i.asn) == Some(asn))
+            && self.organization.as_ref().is_none_or(|name| {
+                info.and_then(|i| i.organization.as_ref())
+                    .is_some_and(|org| org.to_lowercase().contains(&name.to_lowercase()))
+            })
+    }
+}
+async fn traffic_query(
+    State(app): State<App>,
+    Query(search): Query<TrafficSearch>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    if search.country.as_ref().is_some_and(|c| {
+        c != "unknown" && (c.len() != 2 || !c.bytes().all(|b| b.is_ascii_alphabetic()))
+    }) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "country must be a two-letter code or unknown".into(),
+        ));
+    }
+    if search.organization.as_ref().is_some_and(|s| s.len() > 200)
+        || search.interface.as_ref().is_some_and(|s| s.len() > 128)
+        || search.cursor.as_ref().is_some_and(|s| s.len() > 2048)
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "filter or cursor too long".into(),
+        ));
+    }
+    let now = unix_now();
+    let query = TrafficQuery {
+        ip: search.source,
+        destination: search.destination,
+        interface: search.interface.clone(),
+        source_port: search.source_port,
+        resolution: search.resolution.clone().unwrap_or("minute".into()),
+        from: search.from.unwrap_or(now - 86400),
+        to: search.to.unwrap_or(now),
+        protocol: search.protocol,
+        port: search.port,
+        limit: search.limit.unwrap_or(100),
+        cursor: search
+            .cursor
+            .as_ref()
+            .map(|c| serde_json::from_str::<TrafficCursor>(c))
+            .transpose()
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid cursor".into()))?,
+    };
+    if !(1..=500).contains(&query.limit)
+        || !["minute", "hour"].contains(&query.resolution.as_str())
+        || query.from < 0
+        || query.to < query.from
+        || query.to - query.from > 90 * 86400
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "invalid range, resolution, or limit; maximum 90 days and 500 groups".into(),
+        ));
+    }
+    let enrichment = app.ip_enrichment.clone();
+    let live = app
+        .live_traffic
+        .read()
+        .await
+        .for_query_matching(&query, |ip| {
+            search.matches_source(enrichment.lookup(ip).as_ref())
+        });
+    let lookup = app.ip_enrichment.clone();
+    let page = app
+        .db
+        .query_traffic(query, live, move |ip| {
+            search.matches_source(lookup.lookup(ip).as_ref())
+        })
+        .await?;
+    let sources: std::collections::BTreeMap<_, _> = page
+        .rows
+        .iter()
+        .map(|row| (row.source.to_string(), enrichment.lookup(row.source)))
+        .collect();
+    let mut result = serde_json::to_value(page).map_err(anyhow::Error::from)?;
+    result["sources"] = serde_json::to_value(sources).map_err(anyhow::Error::from)?;
+    Ok(Json(result))
+}
+
 async fn events(
     State(app): State<App>,
     Query(q): Query<EventsQuery>,
@@ -576,6 +698,145 @@ mod tests {
         );
         assert_eq!(body["timeline"].as_array().unwrap().len(), 1);
     }
+    #[tokio::test]
+    async fn query_auth_enrichment_filters_validation_and_legacy_cursor() {
+        let mut app = app();
+        app.ip_enrichment = crate::ip_enrichment::tests::fixture_enrichment();
+        let row = |source: &str, port| TrafficRecord {
+            source: source.parse().unwrap(),
+            destination: "192.0.2.1".parse().unwrap(),
+            interface: "eth0".into(),
+            protocol: 6,
+            port: Some(port),
+            counts: TrafficCounts {
+                packets: 3,
+                ..Default::default()
+            },
+            first_seen: 120,
+            last_seen: 129,
+            source_ports: vec![51000],
+            source_ports_truncated: false,
+            application_attribution: Default::default(),
+        };
+        app.db
+            .detail_checkpoint(
+                DetailBatch {
+                    run: "query".into(),
+                    sequence: 1,
+                    from: 120,
+                    to: 130,
+                    rows: vec![
+                        row("192.168.1.1", 443),
+                        row("8.8.8.8", 443),
+                        row("8.8.8.8", 22),
+                    ],
+                    complete: true,
+                    omitted: 0,
+                    gap_from: None,
+                },
+                app.config.retention.clone(),
+                1000,
+            )
+            .await
+            .unwrap();
+        let (session, _) = app
+            .auth
+            .login(
+                "127.0.0.1".parse().unwrap(),
+                "test password long enough".into(),
+            )
+            .await
+            .unwrap();
+        let router = router(app);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/traffic")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        for query in [
+            "country=China",
+            "from=-1",
+            "from=9&to=8",
+            "from=0&to=7776001",
+            "resolution=day",
+            "limit=0",
+            "source=bad",
+            "source_port=65536",
+            "cursor=bad",
+            "unknown=x",
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/traffic?{query}"))
+                        .header(header::COOKIE, format!("einblick_session={session}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+        }
+        for (filters, expected) in [
+            (
+                "country=ro&asn=64512&organization=eXaMpLe&port=443&source_port=51000",
+                1,
+            ),
+            ("country=CN", 0),
+            ("country=unknown", 1),
+            ("asn=999", 0),
+            ("organization=nomatch", 0),
+            ("destination=192.0.2.99", 0),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/v1/traffic?from=120&to=130&{filters}"))
+                        .header(header::COOKIE, format!("einblick_session={session}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert_eq!(
+                body["rows"].as_array().unwrap().len(),
+                expected,
+                "{filters}"
+            );
+            if filters.starts_with("country=ro") {
+                assert_eq!(body["sources"]["8.8.8.8"]["asn"], 64512);
+            }
+        }
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/sources/8.8.8.8/traffic?from=120&to=130&limit=1")
+                    .header(header::COOKIE, format!("einblick_session={session}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let cursor: serde_json::Value =
+            serde_json::from_str(body["next_cursor"].as_str().unwrap()).unwrap();
+        assert_eq!(cursor.as_array().unwrap().len(), 4);
+    }
+
     #[tokio::test]
     async fn source_inspector_enriches_untracked_ips_and_preserves_traffic() {
         let mut app = app();

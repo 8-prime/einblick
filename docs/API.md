@@ -19,6 +19,7 @@ no bearer API tokens or multiple roles are included in this MVP.
 | GET | `/history` | `resolution=minute\|hour`, `from`, `to` Unix seconds; up to 1,000 newest buckets, ascending; 4 MiB data limit |
 | GET | `/analytics` | Optional `from`, `to` Unix seconds; default last 24 hours, maximum 30 days; compact hourly traffic summary |
 | GET | `/events` | `limit` (default 100, max 200), `before` exclusive event ID cursor, optional exact source `ip`; newest first; 4 MiB data limit |
+| GET | `/traffic` | Traffic detail across sources; combined filters and pagination below |
 | GET | `/sources/{ip}/traffic` | Source association detail; parameters and response below |
 
 Login requires an `Origin` matching `public_origin`. All other routes require the
@@ -203,3 +204,28 @@ include `detection`, `rule_created`, `rule_removed`, `mode_changed`, and
 seconds. Detailed health is authenticated. The executable's `--healthcheck`
 checks this endpoint, defaulting to `127.0.0.1:9080`, overridable by
 `EINBLICK_HEALTH_ADDRESS`.
+
+## Traffic query
+
+`GET /traffic` shares the source inspector's range, resolution, limit, and evidence
+metadata. Optional filters combine with AND: exact `source` and `destination`
+IPv4/IPv6 addresses, `interface`, numeric `protocol`, target `port`, sampled
+`source_port` (ports 0–65535), `country` (case-insensitive two-letter code or
+`unknown`), numeric `asn`, and `organization` (case-insensitive substring, max
+200 bytes). Country and ASN use current enrichment, never firewall policy.
+Unknown query parameters are rejected. Defaults: last 24 hours, minute resolution,
+100 groups; maximum 90 days and 500 groups. Pick hourly resolution beyond minute
+retention. Filters apply before pagination to stored and uncommitted traffic.
+
+The response extends `TrafficPage` with `sources`, an IP-keyed map of current
+`IpInfo` or null. Rows sort by `(source,destination,interface,protocol,port)`;
+`next_cursor` encodes that tuple and is opaque to clients. Send it as `cursor`
+with unchanged filters/range. Each page is a fresh read; recent traffic can change
+between pages. The source inspector keeps its existing four-field cursor.
+Responses remain bounded to approximately 4 MiB.
+
+Source-port matching checks bounded samples in each bucket. Matching buckets
+contribute their entire traffic counts; missing/truncated samples can hide
+matches. All time filters include whole overlapping buckets. Query counts may
+differ from country/ASN analytics based on top-100 source summaries. Coverage,
+omissions, expired history, and source-port limitations remain explicit.

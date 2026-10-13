@@ -106,6 +106,15 @@ impl Database {
     }
 
     pub async fn source_traffic(&self, q: TrafficQuery, live: LiveTraffic) -> Result<TrafficPage> {
+        self.query_traffic(q, live, |_| true).await
+    }
+
+    pub async fn query_traffic(
+        &self,
+        q: TrafficQuery,
+        live: LiveTraffic,
+        mut matches_source: impl FnMut(std::net::IpAddr) -> bool + Send + 'static,
+    ) -> Result<TrafficPage> {
         ensure!(
             q.resolution == "minute" || q.resolution == "hour",
             "resolution must be minute or hour"
@@ -126,17 +135,34 @@ impl Database {
             let from = q.from/span*span;
             let to = q.to/span*span;
             let cursor = q.cursor.clone().unwrap_or_default();
-            let mut s = t.prepare("SELECT destination,interface,protocol,port,sum(packets),sum(bytes),sum(passed),sum(dropped),sum(syns),sum(syn_acks),sum(resets),min(first_seen),max(last_seen),min(source_ports),max(truncated) OR count(DISTINCT source_ports)>1
-                FROM traffic WHERE source=? AND resolution=? AND at>=? AND at<=? AND (? IS NULL OR protocol=?) AND (? IS NULL OR port=?)
-                AND (destination,interface,protocol,port)>(?,?,?,?) GROUP BY destination,interface,protocol,port ORDER BY destination,interface,protocol,port LIMIT ?")?;
-            let mut rows = s.query(params![q.ip.to_string(),q.resolution,from,to,q.protocol,q.protocol,q.port,q.port,cursor.0,cursor.1,cursor.2,cursor.3,(q.limit+1) as i64])?;
+            let mut s = t.prepare("SELECT destination,interface,protocol,port,sum(packets),sum(bytes),sum(passed),sum(dropped),sum(syns),sum(syn_acks),sum(resets),min(first_seen),max(last_seen),min(source_ports),max(truncated) OR count(DISTINCT source_ports)>1,source
+                FROM traffic WHERE (? IS NULL OR source=?) AND resolution=? AND at>=? AND at<=? AND (? IS NULL OR protocol=?) AND (? IS NULL OR port=?)
+                AND (? IS NULL OR destination=?) AND (? IS NULL OR interface=?)
+                AND (? IS NULL OR EXISTS(SELECT 1 FROM json_each(source_ports) WHERE value=?))
+                AND (source,destination,interface,protocol,port)>(?,?,?,?,?)
+                GROUP BY source,destination,interface,protocol,port ORDER BY source,destination,interface,protocol,port")?;
+            let source = q.ip.map(|ip|ip.to_string());
+            let destination = q.destination.map(|ip|ip.to_string());
+            let mut rows = s.query(params![source,source,q.resolution,from,to,q.protocol,q.protocol,q.port,q.port,
+                destination,destination,q.interface,q.interface,q.source_port,q.source_port,cursor.0,cursor.1,cursor.2,cursor.3,cursor.4])?;
             let mut found = BTreeMap::new();
+            // Stream groups and apply enrichment before pagination; never load an
+            // entire result into memory or filter just the first page.
+            let mut last_source = None;
+            let mut source_matches = false;
             while let Some(r) = rows.next()? {
+                let source = r.get::<_,String>(15)?.parse()?;
+                if last_source != Some(source) {
+                    source_matches = matches_source(source);
+                    last_source = Some(source);
+                }
+                if !source_matches {continue;}
                 let port: i32 = r.get(3)?;
-                let record = TrafficRecord {source:q.ip,destination:r.get::<_,String>(0)?.parse()?,interface:r.get(1)?,protocol:r.get(2)?,port:if port<0{None}else{Some(port as u16)},
+                let record = TrafficRecord {source,destination:r.get::<_,String>(0)?.parse()?,interface:r.get(1)?,protocol:r.get(2)?,port:if port<0{None}else{Some(port as u16)},
                     counts:TrafficCounts{packets:r.get::<_,i64>(4)? as u64,bytes:r.get::<_,i64>(5)? as u64,passed:r.get::<_,i64>(6)? as u64,dropped:r.get::<_,i64>(7)? as u64,syns:r.get::<_,i64>(8)? as u64,syn_acks:r.get::<_,i64>(9)? as u64,resets:r.get::<_,i64>(10)? as u64},
                     first_seen:r.get(11)?,last_seen:r.get(12)?,source_ports:serde_json::from_str(&r.get::<_,String>(13)?)?,source_ports_truncated:r.get(14)?,application_attribution:ApplicationAttribution{applications:vec![],reasons:vec![]}};
                 found.insert(record.cursor(),record);
+                if found.len()>q.limit {break;}
             }
             // Read only selected associations, streaming and bounding enrichment work.
             // LEFT JOIN retains explicit "not collected" evidence for pre-v3 history.
@@ -149,7 +175,7 @@ impl Database {
                     record.application_attribution.reason(ApplicationReason::QueryLimit);
                     continue;
                 }
-                let mut apps = app_statement.query(params![q.ip.to_string(),q.resolution,from,to,record.destination.to_string(),record.interface,record.protocol,record.port.map_or(-1,i32::from)])?;
+                let mut apps = app_statement.query(params![record.source.to_string(),q.resolution,from,to,record.destination.to_string(),record.interface,record.protocol,record.port.map_or(-1,i32::from)])?;
                 while let Some(r) = apps.next()? {
                     let data: Option<String> = r.get(0)?;
                     attribution_rows += 1;
@@ -188,7 +214,7 @@ impl Database {
                 if n==0 && live_buckets.len()==1 {complete=true;}
                 complete &= batch.complete;
                 omitted += batch.omitted;
-                for record in batch.rows.into_iter().filter(|r|r.source==q.ip && q.protocol.is_none_or(|p|p==r.protocol) && q.port.is_none_or(|p|Some(p)==r.port) && r.cursor()>cursor) {
+                for record in batch.rows.into_iter().filter(|r|q.matches(r) && matches_source(r.source) && r.cursor()>cursor) {
                     if !record.application_attribution.applications.is_empty() || record.application_attribution.reasons.iter().any(|r|!matches!(r,ApplicationReason::Disabled|ApplicationReason::NotCollected)) {
                         attribution_started = Some(attribution_started.unwrap_or(batch.from).min(batch.from));
                     }
@@ -207,6 +233,7 @@ impl Database {
             if coverage.len() < ((to-expected_from)/span+1).max(0) as usize {warnings.push("Some collection intervals are unavailable.".into());complete=false;}
             if !complete && warnings.is_empty() {warnings.push("Traffic detail is incomplete for part of this range.".into());}
             if omitted>0 {warnings.push(format!("{omitted} packet-detail records could not be retained in this range."));}
+            if q.source_port.is_some() {warnings.push("Source port matches retained samples only; missing samples can hide matches. Counts include the whole matching bucket/group, not only that source port.".into());}
             let has_more = found.len()>q.limit;
             let mut out:Vec<_> = found.into_values().take(q.limit+1).collect();
             out.truncate(q.limit);
@@ -265,7 +292,10 @@ mod tests {
     }
     fn query(ip: &str) -> TrafficQuery {
         TrafficQuery {
-            ip: ip.parse().unwrap(),
+            ip: Some(ip.parse().unwrap()),
+            destination: None,
+            interface: None,
+            source_port: None,
             resolution: "minute".into(),
             from: 120,
             to: 130,
@@ -655,6 +685,83 @@ mod tests {
             3
         );
     }
+    #[tokio::test]
+    async fn global_filters_precede_pagination_and_live_checkpoint_deduplicates() {
+        let db = Database::open(":memory:").unwrap();
+        let rows = vec![
+            record("192.0.2.10", Some(443)),
+            record("192.0.2.11", Some(443)),
+            record("192.0.2.12", Some(443)),
+        ];
+        let committed = batch(1, rows.clone());
+        db.detail_checkpoint(committed.clone(), config::Retention::default(), 1000)
+            .await
+            .unwrap();
+        let live = LiveTraffic {
+            batches: vec![committed, batch(2, rows)],
+        };
+        let mut q = query("192.0.2.10");
+        q.ip = None;
+        q.limit = 1;
+        q.destination = Some("192.0.2.1".parse().unwrap());
+        q.interface = Some("eth0".into());
+        q.source_port = Some(51000);
+        q.port = Some(443);
+        q.protocol = Some(6);
+        let matches = |ip: std::net::IpAddr| ip.to_string() != "192.0.2.10";
+        let first = db
+            .query_traffic(q.clone(), live.for_query_matching(&q, matches), matches)
+            .await
+            .unwrap();
+        assert_eq!(first.rows[0].source.to_string(), "192.0.2.11");
+        assert_eq!(first.rows[0].counts.packets, 6);
+        assert!(first.warnings.iter().any(|w| w.contains("samples")));
+        q.cursor = Some(serde_json::from_str(first.next_cursor.as_ref().unwrap()).unwrap());
+        let next = db
+            .query_traffic(q.clone(), live.for_query_matching(&q, matches), matches)
+            .await
+            .unwrap();
+        assert_eq!(next.rows[0].source.to_string(), "192.0.2.12");
+        assert_eq!(next.rows[0].counts.packets, 6);
+        assert!(next.next_cursor.is_none());
+        q.cursor = None;
+        q.source_port = Some(9);
+        assert!(
+            db.query_traffic(q.clone(), live.for_query_matching(&q, matches), matches)
+                .await
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        q.source_port = None;
+        q.destination = Some("192.0.2.99".parse().unwrap());
+        assert!(
+            db.query_traffic(q.clone(), live.for_query_matching(&q, matches), matches)
+                .await
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        q.destination = None;
+        q.interface = Some("other".into());
+        assert!(
+            db.query_traffic(q.clone(), live.for_query_matching(&q, matches), matches)
+                .await
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+        q.interface = None;
+        q.protocol = Some(17);
+        assert!(
+            db.query_traffic(q.clone(), live.for_query_matching(&q, matches), matches)
+                .await
+                .unwrap()
+                .rows
+                .is_empty()
+        );
+    }
+
     #[tokio::test]
     async fn pagination_filters_unknown_ports_and_low_volume_sources() {
         let db = Database::open(":memory:").unwrap();

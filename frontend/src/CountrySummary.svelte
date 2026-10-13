@@ -1,14 +1,16 @@
 <script>
+  import { drilldown } from './query.js';
   import RankedTraffic from './RankedTraffic.svelte';
   import { liveCountries, percentage } from './analytics.js';
   export let snapshot;
   export let onExplore;
+  export let onQuery;
   $: countries = liveCountries(snapshot);
 </script>
 
 <section class="panel">
   <div class="heading"><div><h2>Traffic by country</h2><small>Current process · retained source summary</small></div><button onclick={onExplore}>Explore analytics ↗</button></div>
-  <RankedTraffic rows={countries.rows} total={countries.totals.packets} label="Country" otherLabel="Other mapped countries" limit={5}/>
+  <RankedTraffic rows={countries.rows} total={countries.totals.packets} label="Country" otherLabel="Other mapped countries" limit={5} selectable={row => !!drilldown('country', row.key)} onSelect={row => onQuery(drilldown('country', row.key))}/>
   <footer>{percentage(countries.mappedPackets, countries.totals.packets)} of observed packets mapped to a country. Approximate current IP mapping.</footer>
 </section>
 

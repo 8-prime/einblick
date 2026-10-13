@@ -226,7 +226,18 @@ Overview includes a compact traffic-by-country ranking for the current process.
 **Analytics** summarizes retained hourly traffic for the last 24 hours, seven days,
 or 30 days: country and ASN/network rankings by packets or bytes, an observed /
 passed / blocked timeline, protocol mix, and top TCP/UDP destination ports.
-It refreshes every minute and shows country coverage, incomplete evidence, and
+Select a country, network, protocol, or destination port to open **Query** with
+that filter and the selected analytics time window. Query searches traffic detail
+across all sources, combining country code, ISP/network organization, ASN, source
+and target IP, target and sampled source port, protocol, interface, and preset or
+custom time ranges. Filters run before pagination; results show application
+candidates, TCP indicators, pass/drop counters, and first/last seen, with links to
+the source inspector. The URL preserves the query for bookmarks and navigation.
+Source-port matches use retained samples and show whole matching bucket/group
+counts; they cannot isolate exact per-source-port volume. Detail coverage and
+retention can differ from analytics source-summary rankings.
+
+Analytics refreshes every minute and shows country coverage, incomplete evidence, and
 hours without retained history. Country/network rankings use bounded top-100
 hourly source summaries; unavailable mappings and other/untracked sources are
 explicit. The current database maps historical IPs, so geography is approximate.
