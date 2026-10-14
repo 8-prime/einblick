@@ -5,6 +5,8 @@ mod auth;
 mod backend;
 mod ip_enrichment;
 mod monitor;
+mod service_api;
+mod service_logs;
 use anyhow::{Context, Result};
 use einblick_core::{Config, Snapshot, storage::Database};
 use std::{path::Path, sync::Arc};
@@ -84,6 +86,12 @@ async fn run(
     let (commands, rx) = mpsc::channel(16);
     let (updates, _) = broadcast::channel(4);
     let (stop, _) = broadcast::channel(1);
+    let service_worker = tokio::spawn(service_logs::run(
+        config.clone(),
+        db.clone(),
+        commands.clone(),
+        stop.subscribe(),
+    ));
     let enrichment = ip_enrichment::Enrichment::start(&config, stop.subscribe());
     let mut monitor = monitor::Monitor::new(
         config.clone(),
@@ -138,5 +146,6 @@ async fn run(
         },
         result=&mut server=>{let _=stop.send(());worker.await?;result?;},
     }
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(4), service_worker).await;
     Ok(())
 }

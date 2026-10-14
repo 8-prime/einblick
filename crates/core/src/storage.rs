@@ -57,7 +57,7 @@ impl Database {
         )?;
         let version: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         ensure!(
-            version <= 3,
+            version <= 4,
             "database schema is newer than this application"
         );
         if version == 0 {
@@ -94,6 +94,19 @@ impl Database {
             }
             let t = conn.transaction()?;
             t.execute_batch(include_str!("application_schema.sql"))?;
+            t.commit()?;
+        }
+        if version < 4 {
+            if version == 3 && path != ":memory:" {
+                let backup_path = format!("{path}.schema-v3-backup");
+                ensure!(
+                    !Path::new(&backup_path).exists(),
+                    "migration backup already exists: {backup_path}; preserve it before retrying"
+                );
+                conn.backup(rusqlite::MAIN_DB, &backup_path, None)?;
+            }
+            let t = conn.transaction()?;
+            t.execute_batch(include_str!("service_schema.sql"))?;
             t.commit()?;
         }
         let (read_tx, read_rx) = sync_channel::<Job>(16);

@@ -10,6 +10,10 @@ use std::{
 use tokio::sync::{RwLock, broadcast, mpsc, oneshot};
 
 pub enum Action {
+    ServiceDecision {
+        hit: Box<einblick_core::services::PolicyHit>,
+        complete: bool,
+    },
     Add {
         network: IpNet,
         kind: RuleKind,
@@ -196,6 +200,44 @@ impl Monitor {
     async fn command(&mut self, action: Action) -> Result<()> {
         let now = unix_now();
         match action {
+            Action::ServiceDecision { hit, complete } => {
+                let allowed = self
+                    .config
+                    .management_allowlist
+                    .iter()
+                    .any(|n| n.contains(&hit.source_ip))
+                    || self.rules.iter().any(|r| {
+                        r.kind == RuleKind::Allow
+                            && r.active(now)
+                            && r.network.contains(&hit.source_ip)
+                    });
+                let actor = format!("service:{}:policy:{}", hit.service_id, hit.policy_id);
+                let status = if !complete {
+                    "incomplete_evidence"
+                } else if hit.observe_only {
+                    "observe_only"
+                } else if allowed {
+                    "allowlisted"
+                } else if !self.automatic || !self.blocking {
+                    "global_observe"
+                } else if !self.storage_ok
+                    || !self.detail_storage_ok
+                    || !self.enforcement_ok
+                    || !self.db.healthy.load(std::sync::atomic::Ordering::Acquire)
+                {
+                    "health_suspended"
+                } else if self.rules.iter().any(|r| {
+                    r.actor == actor && r.network.contains(&hit.source_ip) && r.active(now)
+                }) {
+                    "already_active"
+                } else {
+                    "pending"
+                };
+                if let Some(rule) = self.db.service_decision(*hit, status.into(), now).await? {
+                    self.rules.push(rule);
+                    self.dirty = true;
+                }
+            }
             Action::Add {
                 network,
                 kind,
@@ -586,7 +628,11 @@ impl Monitor {
                 && d.eligible
                 && !allowed
                 && !self.rules.iter().any(|r| {
-                    r.kind == RuleKind::Block && r.active(now) && r.network.contains(&d.ip)
+                    r.kind == RuleKind::Block
+                        && r.actor == "detector"
+                        && r.reason.starts_with(&format!("{}:", d.kind))
+                        && r.active(now)
+                        && r.network.contains(&d.ip)
                 })
             {
                 match self
@@ -1098,5 +1144,104 @@ mod tests {
         assert_eq!(recovery.gap_from, Some(now + 20));
         assert_eq!(recovery.omitted, packets);
         assert!(!recovery.complete);
+    }
+    #[tokio::test]
+    async fn service_enforcement_uses_global_safeguards_and_independent_rules() {
+        use einblick_core::services::*;
+        let mut m = monitor(true).await;
+        let mut service =
+            m.db.save_service(ssh_template(), true, unix_now())
+                .await
+                .unwrap();
+        service.observe_only = false;
+        service.policies[0].observe_only = false;
+        service.policies[0].threshold = 1;
+        service = m.db.save_service(service, false, unix_now()).await.unwrap();
+        let hit = playground(
+            &service,
+            "ssh-journal",
+            "Failed password for root from 192.0.2.40 port 44",
+            unix_now(),
+            1,
+        )
+        .unwrap()
+        .decisions[0]
+            .clone();
+        m.command(Action::ServiceDecision {
+            hit: Box::new(hit.clone()),
+            complete: true,
+        })
+        .await
+        .unwrap();
+        assert!(m.rules.is_empty());
+        assert_eq!(
+            m.db.service_decisions(service.id).await.unwrap()[0].status,
+            "global_observe"
+        );
+        m.command(Action::Mode {
+            automatic: true,
+            blocking: true,
+            acknowledged: true,
+        })
+        .await
+        .unwrap();
+        m.command(Action::ServiceDecision {
+            hit: Box::new(hit.clone()),
+            complete: false,
+        })
+        .await
+        .unwrap();
+        assert!(m.rules.is_empty());
+        let mut allowed = hit.clone();
+        allowed.source_ip = "192.0.2.24".parse().unwrap();
+        m.command(Action::ServiceDecision {
+            hit: Box::new(allowed),
+            complete: true,
+        })
+        .await
+        .unwrap();
+        assert!(m.rules.is_empty());
+        m.command(Action::ServiceDecision {
+            hit: Box::new(hit.clone()),
+            complete: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(m.rules.len(), 1);
+        assert!(m.rules[0].applied);
+        let first = m.rules[0].id;
+        let mut second = service.clone();
+        second.id = 0;
+        second.revision = 0;
+        second = m.db.save_service(second, true, unix_now()).await.unwrap();
+        second.observe_only = false;
+        second = m.db.save_service(second, false, unix_now()).await.unwrap();
+        let mut hit2 = hit.clone();
+        hit2.service_id = second.id;
+        hit2.revision = second.revision;
+        m.command(Action::ServiceDecision {
+            hit: Box::new(hit2),
+            complete: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(m.rules.len(), 2);
+        m.command(Action::Remove(first)).await.unwrap();
+        assert!(
+            m.rules
+                .iter()
+                .any(|r| r.id != first && r.active(unix_now()) && r.applied)
+        );
+        m.db.delete_service(service.id, unix_now()).await.unwrap();
+        assert!(
+            m.command(Action::ServiceDecision {
+                hit: Box::new(hit),
+                complete: true
+            })
+            .await
+            .is_err()
+        );
+        m.command(Action::Emergency).await.unwrap();
+        assert!(!m.blocking && !m.automatic);
     }
 }

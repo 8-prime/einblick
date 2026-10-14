@@ -59,3 +59,10 @@ ban_seconds = 600
 minute_days = 7
 hourly_days = 90
 event_days = 90
+
+# Optional service log access. Empty roots/directory disable access by default.
+# Mount only the required host directories read-only; do not grant extra capabilities.
+# File source paths in the web UI must be under one of these roots.
+[service_logs]
+allowed_roots = [] # e.g. ["/host/logs"]
+journal_directory = "" # e.g. "/host/journal" (journalctl is included in the image)

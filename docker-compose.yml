@@ -25,6 +25,13 @@ services:
       - einblick-data:/data
       - ./einblick.toml:/etc/einblick.toml:ro
       - /proc:/host/proc:ro
+      # Optional service protection inputs. Configure only these mounted paths
+      # in [service_logs]; no additional capabilities are needed.
+      # - /var/log/auth.log:/host/logs/auth.log:ro
+      # For rotation, mount its containing directory instead of one file:
+      # - /var/log:/host/logs:ro
+      # - /var/log/journal:/host/journal:ro
+      # Volatile journals: /run/log/journal:/host/journal:ro instead.
       # Optional Docker published-port/NAT attribution. Also set
       # applications.docker_socket = "/var/run/docker.sock" in einblick.toml.
       # A :ro socket mount still grants Docker daemon API access.

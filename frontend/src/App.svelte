@@ -3,6 +3,7 @@
   import IpContext from './IpContext.svelte';
   import Analytics from './Analytics.svelte';
   import Query from './Query.svelte';
+  import Services from './Services.svelte';
   import { queryHash } from './query.js';
   import { readApiResponse } from './api.js';
   import { matchingRules, networkContains, ruleIsActive, ruleStatus } from './firewall.js';
@@ -28,7 +29,7 @@
     const hash = queryHash(filters);
     if (window.location.hash === hash) readRoute(); else window.location.hash = hash;
   }
-  const pages = ['Overview', 'Traffic', 'Analytics', 'Query', 'History', 'Detections', 'Firewall', 'Health'];
+  const pages = ['Overview', 'Traffic', 'Analytics', 'Query', 'Services', 'History', 'Detections', 'Firewall', 'Health'];
   const fmt = (n = 0) => new Intl.NumberFormat('en', { notation: n >= 1000000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(n);
   const bytes = (n = 0) => n >= 1e9 ? `${(n/1e9).toFixed(2)} GB` : n >= 1e6 ? `${(n/1e6).toFixed(1)} MB` : `${(n/1000).toFixed(1)} kB`;
   const time = (s) => s ? new Date(s * 1000).toLocaleString() : '—';
@@ -121,8 +122,8 @@
     <div class="login-art" aria-hidden="true"><div class="orbit o1"></div><div class="orbit o2"></div><div class="orbit o3"></div><div class="art-label">VISIBILITY AT THE EDGE</div><div class="art-dot"></div></div>
   </main>
 {:else}
-  <div class="shell"><aside><div class="brand"><span class="mark">e</span> einblick</div><div class="eyebrow side-label">WORKSPACE / THIS SERVER</div><nav>{#each pages as p,i}<button class:active={page===p} onclick={()=>navigate(p)}><span class="nav-icon">{['◈','≋','▥','⌕','◷','⚑','⊞','⌁'][i]}</span>{p}{#if p==='Detections'&&snapshot?.detections.length}<span class="count">{snapshot.detections.length}</span>{/if}</button>{/each}</nav><div class="side-bottom"><span class="status-dot"></span> Independently hosted <button onclick={logout}>Sign out ↗</button></div></aside>
-    <main class="content"><header><div><span class="eyebrow">NETWORK / {page.toUpperCase()}</span><h1>{page==='Overview'?'Your network, at a glance.':page==='Firewall'?'Control incoming traffic.':page==='Detections'?'Signals worth investigating.':page==='Query'?'Find the traffic behind the numbers.':page==='Analytics'?'Understand your traffic.':page==='History'?'Traffic over time.':page==='Health'?'System health.':'Who’s reaching your server.'}</h1></div><div class="live"><span class="status-dot" class:warning={!snapshot?.health.telemetry_complete}></span>{snapshot?.health.backend.startsWith('mock')?'Demo traffic':'Live ingress'}<small>{time(snapshot?.at)}</small></div></header>
+  <div class="shell"><aside><div class="brand"><span class="mark">e</span> einblick</div><div class="eyebrow side-label">WORKSPACE / THIS SERVER</div><nav>{#each pages as p,i}<button class:active={page===p} onclick={()=>navigate(p)}><span class="nav-icon">{['◈','≋','▥','⌕','◇','◷','⚑','⊞','⌁'][i]}</span>{p}{#if p==='Detections'&&snapshot?.detections.length}<span class="count">{snapshot.detections.length}</span>{/if}</button>{/each}</nav><div class="side-bottom"><span class="status-dot"></span> Independently hosted <button onclick={logout}>Sign out ↗</button></div></aside>
+    <main class="content"><header><div><span class="eyebrow">NETWORK / {page.toUpperCase()}</span><h1>{page==='Overview'?'Your network, at a glance.':page==='Services'?'Protect your services.':page==='Firewall'?'Control incoming traffic.':page==='Detections'?'Signals worth investigating.':page==='Query'?'Find the traffic behind the numbers.':page==='Analytics'?'Understand your traffic.':page==='History'?'Traffic over time.':page==='Health'?'System health.':'Who’s reaching your server.'}</h1></div><div class="live"><span class="status-dot" class:warning={!snapshot?.health.telemetry_complete}></span>{snapshot?.health.backend.startsWith('mock')?'Demo traffic':'Live ingress'}<small>{time(snapshot?.at)}</small></div></header>
     {#if error}<div class="error banner" role="alert">{error}<button onclick={()=>error=''} aria-label="Dismiss error">×</button></div>{/if}
     {#if snapshot?.health.backend.startsWith('mock')}<div class="notice">DEMO MODE <span>Synthetic traffic. Firewall changes are simulated.</span></div>{/if}
     {#if snapshot&&!snapshot.health.telemetry_complete}<div class="notice amber">INCOMPLETE TELEMETRY <span>{snapshot.health.detection_complete?'Detection evidence is complete.':'New automatic bans are suspended.'} {snapshot.health.reasons?.join(' / ')}</span></div>{/if}
@@ -133,6 +134,8 @@
         <section class="panel"><div class="panel-title"><h2>Recent signals</h2><button class="text" onclick={()=>navigate('Detections')}>All events ↗</button></div>{#each [...snapshot.detections].reverse().slice(0,5) as d}<div class="signal"><span class="signal-icon">!</span><div><b>{d.kind.replaceAll('_',' ')}</b><span class="mono">{d.ip}</span><small>{d.evidence}</small></div><small>{new Date(d.at*1000).toLocaleTimeString()}</small></div>{/each}{#if !snapshot.detections.length}<div class="empty roomy"><span class="quiet-icon">◈</span>No recent detections.<small>Thresholds are evaluated as traffic arrives.</small></div>{/if}</section></div>
         <CountrySummary {snapshot} onExplore={()=>navigate('Analytics')} onQuery={openQuery}/>
         <div class="footnote">Ingress packet metadata · SYNs are attempts, including retransmissions · overview totals persist across restarts; source and port summaries cover this process</div>
+      {:else if page==='Services'}
+        <Services {api} {snapshot} {management}/>
       {:else if page==='Analytics'}
         <Analytics {api} onQuery={openQuery}/>
       {:else if page==='Query'}

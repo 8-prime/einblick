@@ -1,6 +1,8 @@
 pub mod config;
 pub mod detector;
 pub mod model;
+mod service_storage;
+pub mod services;
 pub mod storage;
 pub mod traffic;
 mod traffic_storage;

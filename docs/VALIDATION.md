@@ -1,5 +1,49 @@
 # Implementation validation — 2026-10-12
 
+## Service protection — 2026-10-14
+
+- Reviewed and reused the existing Rust/Svelte architecture, bounded SQLite
+  workers, authenticated Origin/CSRF API, monitor commands, audit transactions,
+  allowlists, rule compiler, XDP backend, and mock backend. Schema v4 preserves
+  existing data and backs up v3 databases before migration.
+- Implemented service/source/filter/policy CRUD, an editable observe-only OpenSSH
+  template, file and journal collectors, persistent positions, normalized events,
+  shared Rust playground/replay, independent attributed rule reasons, history,
+  source/policy health, and a selectable generated pipeline. Replay counts are
+  counterfactual estimates over retained normalized events, not proven prevention.
+- **95 Rust tests passed**, with five pre-existing ignored checks (privileged XDP
+  and NAT, two external DB-IP checks, and a manual SQLite resource measurement).
+  Format, strict Clippy, diff whitespace, Svelte check (zero errors/warnings),
+  four frontend test files, production build, and Python syntax checks passed.
+- New coverage includes OpenSSH variants, IPv4/IPv6, extraction errors, regex
+  budgets, timestamps, rolling windows, independent policies, duplicate filters,
+  disabled inputs, side-effect-free simulation beyond 8 KiB, source path/symlink
+  rejection, atomic cursor/event and rule/attribution rollback, configuration
+  revision rejection, v3 backup/restart recovery, file rotation/truncation,
+  journal cursor decoding, and bounded journal backlog progression.
+- The existing HTTP smoke test passed auth, network/application observability,
+  child capability/lifecycle checks, manual IPv6 rules, mode persistence, SSE
+  shutdown, restart, history, audit, and emergency disable. Its debug peak RSS
+  was **45,432 KiB** for the parent and **18,172 KiB** for the application collector;
+  this short synthetic test is not a service-capacity or throughput measurement.
+- `scripts/service-smoke-test.py` passed with actual appended file logs and SQLite,
+  exercising two attributed policies, observe mode, warm-up decisions/cooldown
+  recovery, management protection, global automatic enforcement, pure playground
+  and historical replay, independent rule removal, restart deduplication,
+  truncation health, emergency disable, and service deletion. Enforcement used
+  the existing mock backend; no alternate banning implementation was introduced.
+- Socket fixtures and HTTP smoke tests required running outside the filesystem/
+  network sandbox after localhost listeners were initially denied. Live host
+  journald permissions/vacuum/rotation and privileged XDP were not tested. The
+  kernel program/ABI are unchanged. Browser automation surfaces were unavailable,
+  so no rendered browser walkthrough was performed. Docker image construction was
+  not run; the local Docker daemon socket denied access. The runtime Dockerfile
+  includes journalctl and Compose documents optional read-only mounts without
+  granting additional capabilities.
+
+Setup, limits, security/recovery semantics, and architectural decisions are in
+[SERVICE_PROTECTION.md](SERVICE_PROTECTION.md); API contracts are in [API.md](API.md).
+
 ## Traffic analytics — 2026-10-13
 
 - Added an Overview country summary and Analytics country/network rankings by

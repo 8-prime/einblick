@@ -1,7 +1,7 @@
 # API v1
 
 All JSON endpoints use `/api/v1`. No CORS access is enabled. HTTP errors return
-`{"error":"message"}`. Maximum mutation body size is 8 KiB. The API is single-admin;
+`{"error":"message"}`. Default mutation body size is 8 KiB; service routes allow 192 KiB. The API is single-admin;
 no bearer API tokens or multiple roles are included in this MVP.
 
 | Method | Path | Input / response |
@@ -229,3 +229,98 @@ contribute their entire traffic counts; missing/truncated samples can hide
 matches. All time filters include whole overlapping buckets. Query counts may
 differ from country/ASN analytics based on top-100 source summaries. Coverage,
 omissions, expired history, and source-port limitations remain explicit.
+
+## Service protection
+
+Service endpoints use the same session, Origin, and CSRF protection. These routes
+allow mutation bodies up to **192 KiB**; the 8 KiB limit remains on existing routes.
+`/services/playground` and historical replay return 429 when both evaluation
+workers are occupied. Limits and activation semantics are documented in
+[SERVICE_PROTECTION.md](SERVICE_PROTECTION.md).
+
+| Method | Path | Input / response |
+|---|---|---|
+| GET | `/services` | Array of saved service configurations |
+| POST | `/services` | Configuration → saved service, generated ID/revision; observe-only forced on |
+| GET | `/services/templates` | Editable template configurations; initially `openssh` |
+| GET | `/services/{id}` | `{service, source_health, policy_health, events, decisions, access}`; latest 200 events/decisions |
+| PUT | `/services/{id}` | Complete configuration with current revision → incremented revision; stale writes rejected |
+| DELETE | `/services/{id}` | Soft delete configuration; 204; attributed rules retained until expiry |
+| POST | `/services/playground` | `{service, source_id, input, spacing_seconds:1}` → pure Rust match/policy simulation |
+| POST | `/services/preview` | `{source}` → `{lines, timing}`; bounded read-only preview |
+| POST | `/services/{id}/history-simulation` | Complete draft → `{simulation, limited, from, to, caveat}`; retained-event policy replay |
+| POST | `/services/{id}/sources/{source}/reset` | No body; reset read position to current end, increment revision, audit; 204 |
+
+Configuration example (all IDs inside a service are stable local strings):
+
+```json
+{
+  "id": 0,
+  "revision": 0,
+  "name": "Authentication",
+  "description": "Host authentication failures",
+  "enabled": true,
+  "observe_only": true,
+  "scope": "source_ip",
+  "sources": [{
+    "id": "auth-file",
+    "name": "Authentication log",
+    "enabled": true,
+    "input": {"kind": "file", "path": "/host/logs/auth.log"},
+    "filters": [{
+      "id": "failed-password",
+      "name": "Failed passwords",
+      "enabled": true,
+      "patterns": ["Failed password for (?P<subject>\\S+) from (?P<source_ip>[0-9a-fA-F:.]+) port \\d+"],
+      "event_type": "authentication_failure",
+      "ip_capture": "source_ip",
+      "subject_capture": "subject",
+      "timestamp_capture": null
+    }]
+  }],
+  "policies": [{
+    "id": "repeated-failures",
+    "name": "Repeated failures",
+    "enabled": true,
+    "observe_only": true,
+    "event_types": ["authentication_failure"],
+    "threshold": 5,
+    "window_seconds": 300,
+    "ban_seconds": 600
+  }]
+}
+```
+
+Journal input is `{"kind":"journal","unit":"ssh.service"}`. File paths are
+constrained by operator-configured `service_logs.allowed_roots`; journal access
+requires `service_logs.journal_directory`. Service/individual policy observe flags
+must both be false, global automatic/blocking modes enabled, and current health
+complete before any live decision can create a rule. `scope` currently only
+accepts `source_ip` (whole IP, not a service port).
+
+Match results contain line number, filter ID, status (`matched`, `ignored`, or
+`extraction_failed`), zero-based pattern index, normalized `event`, and `error`.
+Normalized events preserve event/observation times, timestamp origin, service,
+source/filter, IP, event type, optional subject, and raw evidence. Playground
+spacing supplies synthetic timestamps where a filter lacks a timestamp capture.
+An extraction failure makes the batch ineligible for simulated bans, matching
+live source-gap safeguards.
+
+Simulation returns `matches`, per-IP `counts`, `decisions` (policy hits with count,
+window and intended duration), `potentially_preventable`, `source_counts`,
+`filter_counts` (keys `source_id:filter_id`), `policy_counts`, and `timing`.
+Historical replay uses saved normalized events and current policies; it does not
+reapply changed filters to raw historical text. `limited` indicates the 10,000-row
+or 4 MiB sample limit; `caveat` explains incomplete/counterfactual evidence.
+Simulation never writes to SQLite or sends enforcement commands.
+
+A service decision returns immutable triggering `hit`, decision `status`, optional
+`rule_id`, and the current joined existing `Rule`. Statuses are `observe_only`,
+`incomplete_evidence`, `allowlisted`, `global_observe`, `health_suspended`,
+`already_active`, or `pending` (a rule was created). `pending` describes the
+original decision: use the joined rule's enabled/applied/error/expiry fields and
+global allowlists to determine its current effective enforcement status.
+Rule actors are `service:{id}:policy:{policy_id}` and reasons include service and
+policy names. Existing `rule_created`, `enforcement_reconciled`, mode, and removal
+audit entries remain; service-specific audit kinds are `service_saved`,
+`service_deleted`, `service_source_reset`, and `service_decision`.

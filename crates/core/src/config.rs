@@ -29,8 +29,17 @@ pub struct Config {
     pub retention: Retention,
     pub applications: ApplicationConfig,
     pub ip_enrichment: IpEnrichmentConfig,
+    pub service_logs: ServiceLogConfig,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServiceLogConfig {
+    /// Explicit read-only directories; no filesystem access is enabled by default.
+    pub allowed_roots: Vec<String>,
+    /// Explicit journal directories, passed as arguments to journalctl.
+    pub journal_directory: String,
+}
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct IpEnrichmentConfig {
@@ -146,6 +155,7 @@ impl Default for Config {
             retention: Retention::default(),
             applications: ApplicationConfig::default(),
             ip_enrichment: IpEnrichmentConfig::default(),
+            service_logs: ServiceLogConfig::default(),
         }
     }
 }
@@ -156,6 +166,32 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.service_logs.allowed_roots.len() <= 16,
+            "too many log roots"
+        );
+        for root in &self.service_logs.allowed_roots {
+            let p = Path::new(root);
+            ensure!(
+                p.is_absolute()
+                    && p.components().count() > 2
+                    && root.len() <= 4096
+                    && !p
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir)),
+                "log roots must be explicit absolute subdirectories"
+            );
+        }
+        let journal = &self.service_logs.journal_directory;
+        ensure!(
+            journal.is_empty()
+                || (Path::new(journal).is_absolute()
+                    && journal.len() <= 4096
+                    && !Path::new(journal)
+                        .components()
+                        .any(|c| matches!(c, std::path::Component::ParentDir))),
+            "invalid journal directory"
+        );
         self.applications.validate()?;
         ensure!(
             (3600..=7 * 86400).contains(&self.ip_enrichment.check_seconds),

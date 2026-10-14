@@ -12,3 +12,5 @@ tokio.workspace = true
 ipnet.workspace = true
 rusqlite = { version = "0.39", features = ["bundled", "backup"] }
 toml = "0.9"
+regex = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }

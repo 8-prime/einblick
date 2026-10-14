@@ -345,3 +345,13 @@ saturation. A veth test validates behavior; it is not a NIC throughput benchmark
 
 See [docs/API.md](docs/API.md) for the HTTP contract and
 [docs/VALIDATION.md](docs/VALIDATION.md) for checks performed during implementation.
+
+## Service intrusion prevention
+
+The Services dashboard configures journal/file sources, Rust regex filters, rolling
+policies, an editable OpenSSH template, and observe-only or automatic whole-IP
+protection through the existing XDP rule manager. The interactive playground is
+side-effect-free; Overview includes a selectable generated pipeline and historical
+replay estimates of potentially preventable events. Host log access is disabled
+until explicitly configured. See [service protection](docs/SERVICE_PROTECTION.md)
+for read-only mounts, activation, limits, recovery, and test commands.

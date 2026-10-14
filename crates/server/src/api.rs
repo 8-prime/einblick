@@ -108,6 +108,7 @@ pub fn router(app: App) -> Router {
         .route("/rules/{id}", axum::routing::delete(remove_rule))
         .route("/mode", post(mode))
         .route("/emergency-disable", post(emergency))
+        .merge(crate::service_api::routes())
         .route_layer(middleware::from_fn_with_state(app.clone(), protect));
     Router::new()
         .nest("/api/v1", private.route("/auth/login", post(login)))
@@ -986,5 +987,95 @@ mod tests {
                 .status(),
             StatusCode::UNAUTHORIZED
         );
+    }
+    #[tokio::test]
+    async fn service_routes_auth_validation_and_side_effect_free_playground() {
+        use einblick_core::services::*;
+        let app = app();
+        let db = app.db.clone();
+        let (session, csrf) = app
+            .auth
+            .login(
+                "127.0.0.1".parse().unwrap(),
+                "test password long enough".into(),
+            )
+            .await
+            .unwrap();
+        let router = router(app);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/services")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let mut service = ssh_template();
+        service.observe_only = false;
+        let request = |path: &str, value: serde_json::Value| {
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::COOKIE, format!("einblick_session={session}"))
+                .header(header::ORIGIN, "http://localhost:9080")
+                .header("x-csrf-token", &csrf)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(value.to_string()))
+                .unwrap()
+        };
+        let response = router
+            .clone()
+            .oneshot(request(
+                "/api/v1/services",
+                serde_json::to_value(&service).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let created: ProtectedService =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(created.observe_only);
+        // Exercise the route-specific body limit beyond the default 8 KiB limit.
+        let line = "Failed password for root from 192.0.2.1 port 44";
+        let input = serde_json::json!({"service":created,"source_id":"ssh-journal","input":vec![line;300].join("\n"),"spacing_seconds":1});
+        let response = router
+            .clone()
+            .oneshot(request("/api/v1/services/playground", input))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: Simulation =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(result.matches.len(), 300);
+        assert!(!result.decisions.is_empty());
+        assert!(db.rules().await.unwrap().is_empty());
+        assert!(db.service_decisions(created.id).await.unwrap().is_empty());
+        let mut invalid = service.clone();
+        invalid.sources[0].input = SourceInput::File {
+            path: "/etc/passwd".into(),
+        };
+        let response = router
+            .clone()
+            .oneshot(request(
+                "/api/v1/services",
+                serde_json::to_value(invalid).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        service.sources[0].filters[0].patterns = vec!["(".into()];
+        let response = router
+            .oneshot(request(
+                "/api/v1/services",
+                serde_json::to_value(service).unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

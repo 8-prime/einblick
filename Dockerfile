@@ -18,7 +18,7 @@ RUN cargo +nightly-2026-10-12 build --locked --release --manifest-path crates/eb
 RUN EINBLICK_EBPF_OBJECT=/build/crates/ebpf/target/bpfel-unknown-none/release/einblick-ebpf cargo build --locked --release
 
 FROM debian:bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates systemd && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /data
 COPY --from=build /build/target/release/einblick /usr/local/bin/einblick
 WORKDIR /app
