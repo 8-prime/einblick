@@ -22,6 +22,7 @@ jobs:
       - run: cargo test --locked --workspace
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: docker build -t einblick:test .
+      - run: docker run --rm --entrypoint journalctl einblick:test --version
       - name: Prepare isolated kernel tests
         run: |
           rustup toolchain install nightly-2026-10-12 --profile minimal --component rust-src

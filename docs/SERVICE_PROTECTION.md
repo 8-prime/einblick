@@ -61,6 +61,23 @@ or ACLs on the selected directories. Do not add filesystem bypass capabilities,
 mount the host root, or make Einblick privileged for log collection. The HTTP
 parent still drops its existing host-inspection capabilities.
 
+If `journalctl` is not found inside the container, check `dpkg-query -W systemd`.
+An absent package means the running image lacks the runtime dependency; having
+the Services UI only establishes the application version. The repository's final
+Docker stage installs `systemd` and verifies `journalctl --version`; CI also runs
+the command in the resulting image. Rebuild and recreate from the host checkout:
+
+```sh
+docker compose build einblick
+docker compose up -d --force-recreate einblick
+docker compose exec einblick journalctl --version
+```
+
+Use the same Compose file/project used for deployment. If a custom image or
+Dockerfile is used, its final runtime stage also needs the package. Package
+installation belongs in that image build; the repository runs containers with
+a read-only root filesystem.
+
 File sources require absolute regular-file paths beneath configured roots. The
 reader walks pinned directory descriptors using `openat`, `O_NOFOLLOW`, and
 `O_NONBLOCK`; symlinks, traversal, FIFOs, and devices are rejected. Globs are not
