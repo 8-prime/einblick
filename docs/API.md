@@ -7,7 +7,7 @@ no bearer API tokens or multiple roles are included in this MVP.
 | Method | Path | Input / response |
 |---|---|---|
 | POST | `/auth/login` | `{ "password": "…" }` → `{ "csrf": "…" }`, session cookie |
-| GET | `/auth/session` | CSRF token, management allowlist, configured detector thresholds |
+| GET | `/auth/session` | CSRF token, current resolved management allowlist, configured entries, detector thresholds |
 | POST | `/auth/logout` | No body; destroys session; 204 |
 | GET | `/snapshot` | Current `Snapshot` |
 | GET | `/stream` | SSE `snapshot` events; `resync` when a subscriber falls behind |
@@ -33,7 +33,26 @@ otherwise the range is 1 second–365 days. A nonempty reason is required (max 5
 UTF-8 bytes). Duplicate active network/kind pairs are rejected. Allow and block
 rules for the same network can coexist; allow takes precedence. Manual creation of
 a block enables blocking. Automatic mode requires blocking, configured management
-ranges, acknowledgment, and healthy storage/enforcement.
+ranges, successful resolution of all configured management hostnames,
+acknowledgment, and healthy storage/enforcement.
+
+`/auth/session.management_allowlist` remains an array of IP/CIDR strings and now
+contains current resolved addresses. `management_allowlist_configured` contains
+the configuration entries, including DNS hostnames. `Snapshot.management_allowlist`
+provides the current IP/CIDR list on every snapshot/SSE event so clients must use
+it to update source protection after DNS changes. Manual `/rules` entries remain
+IP/CIDR-only; DNS support applies to the configured management allowlist.
+
+`Snapshot.health.management_dns` contains `ready`, `refresh_seconds`,
+`stale_seconds`, and `hosts`. Each host has `hostname`, `networks` (individual
+`/32` or `/128` strings), Unix-second `last_attempt` / `last_success` (or null),
+and `error` (or null). `ready` requires at least one protected network and no
+hostname errors. Lookup errors suspend new packet-detector and service-policy
+bans while preserving automatic-mode intent, existing rules, and manual
+blocking. Last-known DNS addresses expire after the configured stale grace;
+successful refreshes replace the previous set. Kernel synchronization failures
+are still reported through `health.enforcement_ok`; resolved ranges describe
+desired protection until reconciliation succeeds.
 
 Control responses use `{ "accepted":true, "message":"…" }`. This means intent
 was accepted, not that enforcement succeeded. Inspect `Rule.applied/error` and

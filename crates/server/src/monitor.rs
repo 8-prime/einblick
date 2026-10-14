@@ -34,6 +34,7 @@ pub struct Command {
 }
 pub struct Monitor {
     config: Config,
+    management: crate::management::ManagementAllowlist,
     db: Database,
     backend: Backend,
     rules: Vec<Rule>,
@@ -86,8 +87,9 @@ impl Monitor {
         let mut rules = db.rules().await?;
         let (automatic, blocking) = db.settings().await?;
         let automatic = automatic && !config.management_allowlist.is_empty();
+        let management = crate::management::ManagementAllowlist::new(&config).await;
         let mut backend = Backend::new(&config)?;
-        backend.reconcile(&rules, &config.management_allowlist, blocking, unix_now())?;
+        backend.reconcile(&rules, &management.networks, blocking, unix_now())?;
         backend.attach(&config)?;
         for r in &mut rules {
             r.applied = r.active(unix_now()) && (r.kind == RuleKind::Allow || blocking);
@@ -99,6 +101,7 @@ impl Monitor {
         let persisted_totals = db.overview_totals().await?;
         let monitor = Self {
             config,
+            management,
             db,
             backend,
             rules,
@@ -202,8 +205,8 @@ impl Monitor {
         match action {
             Action::ServiceDecision { hit, complete } => {
                 let allowed = self
-                    .config
-                    .management_allowlist
+                    .management
+                    .networks
                     .iter()
                     .any(|n| n.contains(&hit.source_ip))
                     || self.rules.iter().any(|r| {
@@ -221,6 +224,7 @@ impl Monitor {
                 } else if !self.automatic || !self.blocking {
                     "global_observe"
                 } else if !self.storage_ok
+                    || !self.management.ready()
                     || !self.detail_storage_ok
                     || !self.enforcement_ok
                     || !self.db.healthy.load(std::sync::atomic::Ordering::Acquire)
@@ -300,8 +304,8 @@ impl Monitor {
                     "automatic bans require blocking enabled"
                 );
                 ensure!(
-                    !automatic || (!self.config.management_allowlist.is_empty() && acknowledged),
-                    "configure management_allowlist and acknowledge observe-mode evidence first"
+                    !automatic || (self.management.ready() && acknowledged),
+                    "configure management_allowlist, resolve all management hostnames, and acknowledge observe-mode evidence first"
                 );
                 ensure!(
                     !automatic
@@ -337,7 +341,7 @@ impl Monitor {
         }
         match self.backend.reconcile(
             &self.rules,
-            &self.config.management_allowlist,
+            &self.management.networks,
             self.blocking,
             unix_now(),
         ) {
@@ -368,6 +372,9 @@ impl Monitor {
     async fn tick(&mut self) {
         let elapsed = self.last_poll.elapsed().as_secs_f64();
         self.last_poll = std::time::Instant::now();
+        if self.management.poll().await {
+            self.dirty = true;
+        }
         let now = unix_now();
         if self.clock_changed(now, elapsed) {
             self.detail_ok = false;
@@ -612,15 +619,12 @@ impl Monitor {
                 self.storage_ok = false;
                 self.last_error = Some(e.to_string());
             }
-            let allowed = self
-                .config
-                .management_allowlist
-                .iter()
-                .any(|n| n.contains(&d.ip))
+            let allowed = self.management.networks.iter().any(|n| n.contains(&d.ip))
                 || self.rules.iter().any(|r| {
                     r.kind == RuleKind::Allow && r.active(now) && r.network.contains(&d.ip)
                 });
             if self.automatic
+                && self.management.ready()
                 && self.blocking
                 && self.storage_ok
                 && self.detail_storage_ok
@@ -691,6 +695,7 @@ impl Monitor {
         let mut totals = self.persisted_totals.clone();
         totals.add(&self.previous);
         let snap = Snapshot {
+            management_allowlist: self.management.networks.clone(),
             at: unix_now(),
             totals,
             session_totals: self.previous.clone(),
@@ -702,6 +707,7 @@ impl Monitor {
             automatic: self.automatic,
             blocking: self.blocking,
             health: Health {
+                management_dns: self.management.health(),
                 ip_enrichment: self.ip_enrichment.health(),
                 applications: self.applications.health(),
                 backend,
@@ -914,6 +920,174 @@ mod tests {
         );
         m.command(Action::Emergency).await.unwrap();
         assert!(!m.blocking && !m.automatic);
+    }
+
+    #[tokio::test]
+    async fn management_dns_updates_override_bans_and_publish_current_protection() {
+        use crate::management::tests::{fixture, refresh};
+        let mut m = monitor(false).await;
+        m.config.management_allowlist = vec!["home.example".parse().unwrap()];
+        m.management = fixture(&m.config, "home.example", &["192.0.2.24", "2001:db8::12"]);
+        m.command(Action::Add {
+            network: "192.0.2.0/24".parse().unwrap(),
+            kind: RuleKind::Block,
+            reason: "test covering ban".into(),
+            seconds: None,
+        })
+        .await
+        .unwrap();
+        m.command(Action::Mode {
+            automatic: true,
+            blocking: true,
+            acknowledged: true,
+        })
+        .await
+        .unwrap();
+        let mut o = m.backend.poll().unwrap();
+        assert!(o.traffic.iter().all(|r| r.counts.dropped == 0));
+        for source in &mut o.sources {
+            source.syns = 20;
+        }
+        m.process(unix_now(), 1.0, o).await;
+        assert!(!m.rules.iter().any(|r| {
+            r.actor == "detector"
+                && m.management
+                    .networks
+                    .iter()
+                    .any(|n| n.contains(&r.network.addr()))
+        }));
+        {
+            let snap = m.snapshot.read().await;
+            assert_eq!(snap.management_allowlist, m.management.networks);
+            assert!(snap.health.management_dns.ready);
+            assert_eq!(snap.health.management_dns.hosts[0].hostname, "home.example");
+        }
+        refresh(&mut m.management, "home.example", Some(&["192.0.2.25"]));
+        m.dirty = true;
+        m.reconcile().await;
+        let o = m.backend.poll().unwrap();
+        let old = o
+            .traffic
+            .iter()
+            .find(|r| r.source == "192.0.2.24".parse::<IpAddr>().unwrap())
+            .unwrap();
+        assert!(old.counts.dropped > 0);
+        m.publish(Totals::default(), true).await;
+        assert_eq!(
+            m.snapshot.read().await.management_allowlist,
+            vec!["192.0.2.25/32".parse().unwrap()]
+        );
+        assert!(
+            m.rules
+                .iter()
+                .any(|r| r.network == "192.0.2.0/24".parse::<IpNet>().unwrap() && r.applied)
+        );
+    }
+
+    #[tokio::test]
+    async fn management_dns_failure_suspends_bans_and_recovers_without_mode_change() {
+        use crate::management::tests::{fixture, refresh};
+        let mut m = monitor(false).await;
+        m.config.management_allowlist = vec!["home.example".parse().unwrap()];
+        m.management = fixture(&m.config, "home.example", &[]);
+        assert!(
+            m.command(Action::Mode {
+                automatic: true,
+                blocking: true,
+                acknowledged: true
+            })
+            .await
+            .is_err()
+        );
+        refresh(&mut m.management, "home.example", Some(&["192.0.2.24"]));
+        m.command(Action::Mode {
+            automatic: true,
+            blocking: true,
+            acknowledged: true,
+        })
+        .await
+        .unwrap();
+        refresh(&mut m.management, "home.example", None);
+        let o = m.backend.poll().unwrap();
+        m.process(unix_now(), 1.0, o).await;
+        assert!(m.automatic && m.blocking && m.rules.is_empty());
+        assert!(m.recent.iter().any(|d| d.eligible));
+        assert!(!m.snapshot.read().await.health.management_dns.ready);
+        refresh(&mut m.management, "home.example", Some(&["192.0.2.24"]));
+        let mut o = m.backend.poll().unwrap();
+        // Use a new scan event: the earlier SYN detection is on cooldown.
+        o.syns = (1..=30)
+            .map(|port| ("198.51.100.9".parse().unwrap(), port))
+            .collect();
+        m.process(unix_now() + 1, 1.0, o).await;
+        assert!(m.rules.iter().any(|r| r.actor == "detector"));
+        assert!(m.snapshot.read().await.health.management_dns.ready);
+    }
+
+    #[tokio::test]
+    async fn service_policies_respect_management_dns_and_suspend_on_lookup_failure() {
+        use crate::management::tests::{fixture, refresh};
+        use einblick_core::services::*;
+        let mut m = monitor(false).await;
+        m.config.management_allowlist = vec!["home.example".parse().unwrap()];
+        m.management = fixture(&m.config, "home.example", &["192.0.2.24"]);
+        m.command(Action::Mode {
+            automatic: true,
+            blocking: true,
+            acknowledged: true,
+        })
+        .await
+        .unwrap();
+        let mut service =
+            m.db.save_service(ssh_template(), true, unix_now())
+                .await
+                .unwrap();
+        service.observe_only = false;
+        service.policies[0].observe_only = false;
+        service.policies[0].threshold = 1;
+        service = m.db.save_service(service, false, unix_now()).await.unwrap();
+        let mut hit = playground(
+            &service,
+            "ssh-journal",
+            "Failed password for root from 192.0.2.24 port 44",
+            unix_now(),
+            1,
+        )
+        .unwrap()
+        .decisions[0]
+            .clone();
+        m.command(Action::ServiceDecision {
+            hit: Box::new(hit.clone()),
+            complete: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            m.db.service_decisions(service.id).await.unwrap()[0].status,
+            "allowlisted"
+        );
+        refresh(&mut m.management, "home.example", None);
+        hit.source_ip = "192.0.2.40".parse().unwrap();
+        m.command(Action::ServiceDecision {
+            hit: Box::new(hit.clone()),
+            complete: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            m.db.service_decisions(service.id).await.unwrap()[0].status,
+            "health_suspended"
+        );
+        assert!(m.rules.is_empty());
+        refresh(&mut m.management, "home.example", Some(&["192.0.2.24"]));
+        m.command(Action::ServiceDecision {
+            hit: Box::new(hit),
+            complete: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(m.rules.len(), 1);
+        assert!(m.rules[0].applied);
     }
     #[tokio::test]
     async fn incomplete_telemetry_and_audit_failure_prevent_bans() {

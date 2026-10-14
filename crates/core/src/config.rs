@@ -24,12 +24,75 @@ pub struct Config {
     pub detail_minute_capacity: usize,
     pub detail_row_limit: usize,
     pub ring_bytes: u32,
-    pub management_allowlist: Vec<IpNet>,
+    pub management_allowlist: Vec<ManagementEntry>,
+    pub management_dns_refresh_seconds: u64,
+    pub management_dns_stale_seconds: u64,
     pub detection: Thresholds,
     pub retention: Retention,
     pub applications: ApplicationConfig,
     pub ip_enrichment: IpEnrichmentConfig,
     pub service_logs: ServiceLogConfig,
+}
+
+/// Management exemptions accept literal networks, individual IPs, or DNS names.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum ManagementEntry {
+    Network(IpNet),
+    Hostname(String),
+}
+
+impl std::str::FromStr for ManagementEntry {
+    type Err = anyhow::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        if let Ok(network) = value.parse::<IpNet>() {
+            return Ok(Self::Network(network.trunc()));
+        }
+        if let Ok(ip) = value.parse::<IpAddr>() {
+            return Ok(Self::Network(IpNet::from(ip)));
+        }
+        let hostname = value.strip_suffix('.').unwrap_or(value);
+        ensure!(
+            valid_management_hostname(hostname),
+            "invalid management allowlist entry {value:?}; use an IP, CIDR, or fully qualified DNS hostname"
+        );
+        Ok(Self::Hostname(hostname.to_ascii_lowercase()))
+    }
+}
+
+fn valid_management_hostname(hostname: &str) -> bool {
+    hostname.len() <= 253
+        && hostname.contains('.')
+        && hostname
+            .rsplit('.')
+            .next()
+            .is_some_and(|label| label.bytes().any(|c| c.is_ascii_alphabetic()))
+        && hostname.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'-')
+        })
+}
+
+impl TryFrom<String> for ManagementEntry {
+    type Error = anyhow::Error;
+    fn try_from(value: String) -> Result<Self> {
+        value.parse()
+    }
+}
+
+impl From<ManagementEntry> for String {
+    fn from(value: ManagementEntry) -> Self {
+        match value {
+            ManagementEntry::Network(network) => network.to_string(),
+            ManagementEntry::Hostname(hostname) => hostname,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -151,6 +214,8 @@ impl Default for Config {
             detail_row_limit: 1_000_000,
             ring_bytes: 1 << 20,
             management_allowlist: vec![],
+            management_dns_refresh_seconds: 60,
+            management_dns_stale_seconds: 300,
             detection: Thresholds::default(),
             retention: Retention::default(),
             applications: ApplicationConfig::default(),
@@ -232,6 +297,20 @@ impl Config {
         ensure!(
             self.management_allowlist.len() <= 128,
             "management allowlist capacity exceeded"
+        );
+        for entry in &self.management_allowlist {
+            if let ManagementEntry::Hostname(hostname) = entry {
+                ensure!(
+                    valid_management_hostname(hostname),
+                    "invalid management hostname"
+                );
+            }
+        }
+        ensure!(
+            (10..=3600).contains(&self.management_dns_refresh_seconds)
+                && self.management_dns_stale_seconds >= self.management_dns_refresh_seconds
+                && self.management_dns_stale_seconds <= 86400,
+            "management DNS refresh must be 10–3600 seconds; stale grace must be at least the refresh interval and at most one day"
         );
         ensure!(
             !self.public_origin.ends_with('/') && !self.public_origin.contains(['\r', '\n']),
@@ -325,5 +404,93 @@ impl ApplicationConfig {
             );
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod management_tests {
+    use super::*;
+
+    #[test]
+    fn management_entries_accept_cidrs_ips_and_normalized_hostnames() {
+        let config: Config = toml::from_str(r#"
+            mock = true
+            management_allowlist = ["192.0.2.10/24", "2001:db8::1", "HOME.Example.", "p549b2893.dip0.t-ipconnect.de"]
+        "#).unwrap();
+        config.validate().unwrap();
+        assert_eq!(
+            serde_json::to_value(config.management_allowlist).unwrap(),
+            serde_json::json!([
+                "192.0.2.0/24",
+                "2001:db8::1/128",
+                "home.example",
+                "p549b2893.dip0.t-ipconnect.de"
+            ])
+        );
+        assert!(matches!(
+            "192.0.2.1".parse::<ManagementEntry>().unwrap(),
+            ManagementEntry::Network(_)
+        ));
+    }
+
+    #[test]
+    fn management_entries_reject_urls_ports_wildcards_and_malformed_names() {
+        for invalid in [
+            "",
+            "localhost",
+            "192.0.2.999",
+            "192.0.2.1/33",
+            "::1/129",
+            "https://home.example",
+            "home.example:443",
+            "*.example.com",
+            "home..example",
+            "-home.example",
+            "home-.example",
+            "home_example.com",
+            " home.example",
+            "home.example..",
+            "hôme.example",
+        ] {
+            assert!(
+                invalid.parse::<ManagementEntry>().is_err(),
+                "accepted {invalid:?}"
+            );
+            assert!(
+                toml::from_str::<Config>(&format!("management_allowlist = [{invalid:?}]")).is_err()
+            );
+        }
+        assert!(
+            format!("{}.example", "x".repeat(64))
+                .parse::<ManagementEntry>()
+                .is_err()
+        );
+        assert!(
+            format!(
+                "{}.{}.{}.{}.example",
+                "x".repeat(63),
+                "x".repeat(63),
+                "x".repeat(63),
+                "x".repeat(63)
+            )
+            .parse::<ManagementEntry>()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn management_dns_settings_have_bounded_refresh_and_grace() {
+        let mut config = Config {
+            mock: true,
+            ..Config::default()
+        };
+        config.validate().unwrap();
+        config.management_dns_refresh_seconds = 9;
+        assert!(config.validate().is_err());
+        config.management_dns_refresh_seconds = 60;
+        config.management_dns_stale_seconds = 59;
+        assert!(config.validate().is_err());
+        config.management_dns_stale_seconds = 86401;
+        assert!(config.validate().is_err());
     }
 }

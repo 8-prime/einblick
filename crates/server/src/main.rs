@@ -4,6 +4,7 @@ mod applications;
 mod auth;
 mod backend;
 mod ip_enrichment;
+mod management;
 mod monitor;
 mod service_api;
 mod service_logs;

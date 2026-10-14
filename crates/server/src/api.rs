@@ -167,8 +167,10 @@ async fn session(
     State(app): State<App>,
     axum::Extension(s): axum::Extension<crate::auth::Session>,
 ) -> Json<serde_json::Value> {
+    let snapshot = app.snapshot.read().await;
     Json(
-        serde_json::json!({"csrf":s.csrf,"management_allowlist":app.config.management_allowlist,"thresholds":app.config.detection,
+        serde_json::json!({"csrf":s.csrf,"management_allowlist":snapshot.management_allowlist,
+            "management_allowlist_configured":app.config.management_allowlist,"thresholds":app.config.detection,
             "detail_limits":{"minute_days":app.config.retention.minute_days,"hourly_days":app.config.retention.hourly_days,"row_limit":app.config.detail_row_limit}}),
     )
 }
@@ -596,6 +598,50 @@ mod tests {
             shutdown: broadcast::channel(1).0,
         }
     }
+    #[tokio::test]
+    async fn session_and_snapshot_report_current_dns_addresses_and_configured_names() {
+        let mut app = app();
+        Arc::make_mut(&mut app.config).management_allowlist = vec!["home.example".parse().unwrap()];
+        app.snapshot.write().await.management_allowlist = vec!["192.0.2.24/32".parse().unwrap()];
+        let (session, _) = app
+            .auth
+            .login(
+                "127.0.0.1".parse().unwrap(),
+                "test password long enough".into(),
+            )
+            .await
+            .unwrap();
+        let routes = router(app.clone());
+        for address in ["192.0.2.24/32", "2001:db8::24/128"] {
+            app.snapshot.write().await.management_allowlist = vec![address.parse().unwrap()];
+            for path in ["/api/v1/auth/session", "/api/v1/snapshot"] {
+                let response = routes
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri(path)
+                            .header(header::COOKIE, format!("einblick_session={session}"))
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: serde_json::Value = serde_json::from_slice(
+                    &response.into_body().collect().await.unwrap().to_bytes(),
+                )
+                .unwrap();
+                assert_eq!(body["management_allowlist"], serde_json::json!([address]));
+                if path.ends_with("session") {
+                    assert_eq!(
+                        body["management_allowlist_configured"],
+                        serde_json::json!(["home.example"])
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn analytics_auth_ranges_and_current_enrichment() {
         let mut app = app();

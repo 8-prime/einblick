@@ -46,6 +46,37 @@ binds the web service to `127.0.0.1:9080`. This is separate from capture: XDP se
 all ingress on selected interfaces, including forwarded/container traffic before
 host firewall/NAT handling.
 
+For a changing residential address, use a Dynamic DNS hostname that your router
+updates, for example:
+
+```toml
+management_allowlist = ["home.example.net", "192.0.2.24/32"]
+management_dns_refresh_seconds = 60
+management_dns_stale_seconds = 300
+```
+
+Entries accept individual IPv4/IPv6 addresses, CIDRs, and fully qualified DNS
+hostnames (ASCII or punycode, no scheme, port, or wildcard). DNS names resolve via
+the server's system resolver to individual `/32` and `/128` exemptions, before
+initial firewall attachment and every 60 seconds while running. Successful
+refreshes replace old addresses without restarting or deleting ban rules; the
+management allowlist takes precedence over those rules. DNS/cache propagation
+can still leave a gap after your public IP changes. Configuration edits require a
+restart; changes to the configured hostname's DNS records do not.
+
+Failed, empty, or oversized DNS answers retain the last addresses for at most
+300 seconds after their last successful lookup, then remove them. All configured
+hostnames must resolve before automatic mode can be enabled; new automatic bans
+are suspended during lookup failures and resume on recovery. Existing bans and
+manual blocking continue, so keep your provider console available. DNS state and
+protected addresses update live on Firewall and Health. Lookups time out after
+five seconds and run outside the capture/control loop. Limits are 128 configured
+entries, 16 distinct addresses per hostname, and 128 resolved management networks.
+`management_dns_refresh_seconds` accepts 10–3600 seconds; the stale grace must be
+at least that interval and at most 86400 seconds. Only use DNS names you trust:
+their resolved addresses are exempt from all Einblick bans. This is a firewall
+exemption, not a dashboard login restriction.
+
 For this rootful production stack, make the password file readable by UID 0:
 
 ```sh

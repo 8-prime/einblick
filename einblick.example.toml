@@ -18,7 +18,13 @@ detail_minute_capacity = 16384
 detail_row_limit = 1000000
 ring_bytes = 1048576
 # Protect your actual administrator / VPN address before enabling automatic bans.
+# Accepts IPs, CIDRs, and DNS hostnames whose A/AAAA records track your home IP.
+# Example: ["home.example.net", "192.0.2.24/32"] (no URL scheme or port).
 management_allowlist = []
+# Refresh DNS while running; failed lookups suspend new automatic bans.
+management_dns_refresh_seconds = 60
+# Retain the last addresses for this long after their last successful lookup.
+management_dns_stale_seconds = 300
 
 [ip_enrichment]
 # Public DB-IP Lite country/ASN downloads; no account or API token required.

@@ -122,6 +122,8 @@ impl Rule {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Health {
     #[serde(default)]
+    pub management_dns: ManagementDnsHealth,
+    #[serde(default)]
     pub ip_enrichment: IpEnrichmentHealth,
     #[serde(default)]
     pub applications: crate::ApplicationHealth,
@@ -138,6 +140,21 @@ pub struct Health {
     pub last_tick: i64,
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ManagementDnsHealth {
+    pub ready: bool,
+    pub refresh_seconds: u64,
+    pub stale_seconds: u64,
+    pub hosts: Vec<ManagementDnsHost>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ManagementDnsHost {
+    pub hostname: String,
+    pub networks: Vec<IpNet>,
+    pub last_attempt: Option<i64>,
+    pub last_success: Option<i64>,
+    pub error: Option<String>,
+}
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct MapHealth {
     pub name: String,
     pub used: usize,
@@ -145,6 +162,8 @@ pub struct MapHealth {
 }
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default)]
+    pub management_allowlist: Vec<IpNet>,
     pub at: i64,
     pub totals: Totals,
     #[serde(default)]

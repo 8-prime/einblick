@@ -1,5 +1,29 @@
 # Implementation validation — 2026-10-12
 
+## Management DNS — 2026-10-14
+
+- Management configuration accepts CIDRs, literal IPv4/IPv6 addresses, and
+  validated DNS hostnames. System-resolver results become individual host
+  exemptions in the existing rule compiler, packet detector, and service-policy
+  enforcement. DNS refresh runs outside capture/control, with bounded answers,
+  lookup deadlines, and monotonic expiry of last-known addresses.
+- **107 Rust tests passed**, with five pre-existing ignored checks. Coverage
+  includes parsing, hostname normalization/rejection, mixed IPv4/IPv6 answers,
+  deduplication, address replacement, static overlaps, lookup failures, stale
+  expiry/recovery, capacity rejection, nonblocking refresh polling, allowlist
+  precedence, service policies, and current API/session metadata.
+- Strict Clippy and Rust formatting passed. Svelte check reported zero errors or
+  warnings; all 13 frontend tests and the production build passed.
+- `scripts/management-dns-smoke-test.py` uses an isolated mount namespace and a
+  temporary hosts fixture to exercise the real system resolver and running mock
+  server. It verifies startup IPv4/IPv6 exemptions, live address replacement over
+  existing subnet bans, failed-lookup grace/expiry, activation safeguards, and
+  recovery without restart or lost rules. Run after `cargo build` with:
+  `sudo unshare --mount --propagation private -- python3 scripts/management-dns-smoke-test.py`.
+- The XDP program and map ABI are unchanged. Enforcement validation uses the mock
+  backend; privileged XDP and actual residential DDNS-provider propagation are
+  not part of this check.
+
 ## Service protection — 2026-10-14
 
 - Reviewed and reused the existing Rust/Svelte architecture, bounded SQLite
