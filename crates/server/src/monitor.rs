@@ -1320,6 +1320,120 @@ mod tests {
         assert!(!recovery.complete);
     }
     #[tokio::test]
+    async fn service_observe_flags_and_active_bans_do_not_advance_escalation() {
+        use einblick_core::services::*;
+        let mut m = monitor(true).await;
+        m.command(Action::Mode {
+            automatic: true,
+            blocking: true,
+            acknowledged: true,
+        })
+        .await
+        .unwrap();
+        let mut service =
+            m.db.save_service(ssh_template(), true, unix_now())
+                .await
+                .unwrap();
+        service.policies[0].threshold = 1;
+        service.policies[0].ban_escalation = Some(BanEscalation {
+            multiplier: 2,
+            max_ban_seconds: 86400,
+            reset_after_seconds: 604800,
+        });
+        for (service_observe, policy_observe) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            service.observe_only = service_observe;
+            service.policies[0].observe_only = policy_observe;
+            service = m.db.save_service(service, false, unix_now()).await.unwrap();
+            let hit = playground(
+                &service,
+                "ssh-journal",
+                "Failed password for root from 192.0.2.40 port 44",
+                unix_now(),
+                1,
+            )
+            .unwrap()
+            .decisions
+            .remove(0);
+            m.command(Action::ServiceDecision {
+                hit: Box::new(hit),
+                complete: true,
+            })
+            .await
+            .unwrap();
+            let decisions = m.db.service_decisions(service.id).await.unwrap();
+            assert_eq!(
+                decisions[0].status,
+                if service_observe || policy_observe {
+                    "observe_only"
+                } else {
+                    "pending"
+                }
+            );
+            assert_eq!(
+                m.rules.len(),
+                usize::from(!service_observe && !policy_observe)
+            );
+        }
+        let first = m.rules[0].clone();
+        let hit = playground(
+            &service,
+            "ssh-journal",
+            "Failed password for root from 192.0.2.40 port 44",
+            unix_now(),
+            1,
+        )
+        .unwrap()
+        .decisions
+        .remove(0);
+        m.command(Action::ServiceDecision {
+            hit: Box::new(hit),
+            complete: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            m.db.service_decisions(service.id).await.unwrap()[0].status,
+            "already_active"
+        );
+        service.observe_only = true;
+        service = m.db.save_service(service, false, unix_now()).await.unwrap();
+        let hit = playground(
+            &service,
+            "ssh-journal",
+            "Failed password for root from 192.0.2.40 port 44",
+            unix_now(),
+            1,
+        )
+        .unwrap()
+        .decisions
+        .remove(0);
+        m.command(Action::ServiceDecision {
+            hit: Box::new(hit),
+            complete: true,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            m.db.service_decisions(service.id).await.unwrap()[0].status,
+            "observe_only"
+        );
+        assert_eq!(m.rules.len(), 1);
+        assert_eq!(m.rules[0].expires, first.expires);
+        assert!(m.rules[0].applied);
+        m.db.call(|c| {
+            assert_eq!(
+                c.query_row("SELECT ban_count FROM service_ban_history", [], |r| r
+                    .get::<_, u32>(0))?,
+                1
+            );
+            Ok(())
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
     async fn service_enforcement_uses_global_safeguards_and_independent_rules() {
         use einblick_core::services::*;
         let mut m = monitor(true).await;

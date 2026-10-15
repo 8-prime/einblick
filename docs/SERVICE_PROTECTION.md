@@ -14,7 +14,15 @@ Verify your unit (`ssh.service` on some hosts, `sshd.service` on others), inspec
 sample logs, and review the evidence. Disable the service and policy observe-only
 flags, then enable **Automatic IP bans** in Firewall with its existing management
 allowlist and acknowledgment. Detection enabled is separate from enforcement
-requested. All decisions pass through the monitor's global mode, management and
+requested. A service observe-only flag overrides every policy; a policy observe-only
+flag applies to that policy alone. **Both must be off** for a service policy to
+create a new ban. Observe mode continues collecting normalized events on
+**Overview → Recent normalized detections** and threshold decisions in
+**Decisions & Bans**, with no rule attached to observation-only decisions. Saving
+observe-only settings does not remove existing bans: they expire independently
+or can be removed in Firewall. Packet-based detectors run independently and are
+controlled by global Firewall settings. Unsaved edits do not affect live behavior.
+All decisions pass through the monitor's global mode, management and
 rule allowlists, storage health, and enforcement health. Emergency disable affects
 service bans through that same monitor.
 
@@ -29,7 +37,7 @@ leaves existing rules to expire. Individual rules can be removed in Firewall.
 Each policy/service reason owns a distinct persisted rule. The existing compiler
 merges equal IPs/CIDRs using the longest deadline; removing one reason cannot
 remove an independent reason. Manual allowlists always take precedence. Removed,
-expired, pending, failed, and applied rules are distinguished in Ban History.
+expired, pending, failed, and applied rules are distinguished in Decisions & Bans.
 
 ## Container host-log access
 
@@ -135,6 +143,32 @@ optimistic revisions; edits invalidate old in-flight checkpoints and decisions,
 clear policy windows, and re-enter warm-up. Persisted events and decisions retain
 their original attribution and evidence after edits/deletion.
 
+## Repeat-ban escalation
+
+Policies use a fixed `ban_seconds` duration by default. Enable **Escalate repeat
+bans** on a detection policy to configure `ban_escalation`: `multiplier` (2–10),
+`max_ban_seconds` (at least the base duration, at most 604,800), and
+`reset_after_seconds` (1–31,536,000). For example, a 600s base with multiplier 2
+creates bans of 600s, 1,200s, 2,400s, and so on, up to the cap. The sequence resets
+when the interval since the last ban reaches the reset duration.
+
+History belongs to one service/policy/source-IP combination and survives restart,
+rule removal, and event-history pruning. It starts when escalation is enabled;
+older fixed-duration bans are not reconstructed. Only new committed rules advance
+the sequence. Observe-only, allowlisted, incomplete, suspended, and already-active
+decisions do not advance it. Events during an active ban do not extend its deadline.
+The decision history displays the effective duration of each created rule.
+
+History and rule/decision/audit creation share one transaction. Expired history is
+pruned; at most 65,536 history entries are retained globally. Capacity exhaustion
+suppresses new escalating bans instead of silently losing repeat-offender state.
+Service deletion clears its escalation state while existing rules keep their expiry.
+Removing a policy or turning off its escalation also clears that policy's sequence;
+turning it back on starts fresh. Disabling detection or enabling observe-only keeps
+unexpired history. Changing the reset interval updates unexpired history relative
+to its last ban; expired sequences are not revived. Base duration, multiplier, and
+cap edits use the saved settings for the next ban without resetting the count.
+
 ## Playground and historical estimates
 
 Edit regexes/capture names/event types and paste multiline text on Sources &
@@ -142,7 +176,9 @@ Filters. Evaluation is debounced and uses the real Rust parser and policy engine
 Each filter/line shows Matched (neutral), Ignored (muted), or Extraction failed
 (amber), pattern index, IP, subject, and the complete normalized event. Simulation
 lists counts, policy thresholds, and red **Would ban** decisions with duration.
-No simulation writes an event, decision, cursor, audit entry, or enforcement rule.
+Simulations apply repeat-ban escalation to their own hypothetical ban sequence,
+starting fresh within the sample; they do not read live offender history. No
+simulation writes an event, decision, cursor, audit entry, or enforcement rule.
 Recent source preview is bounded and read-only. Its pasted journal text does not
 carry journal timestamps; use timestamp captures or the explicit synthetic line
 spacing to test policy timing.
@@ -165,7 +201,9 @@ the displayed replay. The response reports truncation and the sampled time range
 
 Schema v4 adds `protected_services`, `service_sources`, `security_events`, and
 `service_decisions` through the existing migration sequence. Existing v3 databases
-get a `.schema-v3-backup` before migration. Sources/filters/policies are bounded,
+get a `.schema-v3-backup` before migration. Schema v5 adds `service_ban_history`;
+existing v4 databases get a `.schema-v4-backup` before migration.
+Sources/filters/policies are bounded,
 validated configuration JSON in service rows, following existing JSON persistence
 patterns; source cursors and searchable events/decisions have separate tables.
 Rule and decision creation and the existing rule/audit events share one SQLite

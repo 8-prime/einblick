@@ -305,7 +305,8 @@ Configuration example (all IDs inside a service are stable local strings):
     "event_types": ["authentication_failure"],
     "threshold": 5,
     "window_seconds": 300,
-    "ban_seconds": 600
+    "ban_seconds": 600,
+    "ban_escalation": null
   }]
 }
 ```
@@ -316,6 +317,21 @@ requires `service_logs.journal_directory`. Service/individual policy observe fla
 must both be false, global automatic/blocking modes enabled, and current health
 complete before any live decision can create a rule. `scope` currently only
 accepts `source_ip` (whole IP, not a service port).
+
+Policies optionally accept `ban_escalation`, defaulting to `null` (fixed duration):
+`{"multiplier":2,"max_ban_seconds":86400,"reset_after_seconds":604800}`.
+Each new committed ban for the same service/policy/IP multiplies the base duration,
+up to the cap. The sequence resets once the interval since its last ban reaches
+`reset_after_seconds`. History survives restarts and is independent of event
+retention. Bounds: multiplier 2–10, maximum from base duration to 604800s, reset
+1–31536000s. Observe-only and suppressed decisions do not advance this history;
+existing active bans are not extended. Created decision hits report the effective
+`ban_seconds`; non-enforcing hits retain the configured base duration. Simulations
+apply escalation using only hypothetical bans inside their sample.
+Saving a policy without escalation, or removing it, clears its repeat-ban history.
+Detection/observe switches retain unexpired history. Reset-interval edits update
+existing unexpired sequences from their last ban; expired sequences stay reset.
+Other duration edits retain the count and apply to the next ban.
 
 Match results contain line number, filter ID, status (`matched`, `ignored`, or
 `extraction_failed`), zero-based pattern index, normalized `event`, and `error`.

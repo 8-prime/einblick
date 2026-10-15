@@ -79,6 +79,7 @@ allowed_roots = ["{logs}"]
         second_policy = copy.deepcopy(service['policies'][0])
         second_policy.update(id='second-policy', name='Independent longer reason', ban_seconds=60)
         service['policies'].append(second_policy)
+        service['policies'][0]['ban_escalation'] = {'multiplier': 2, 'max_ban_seconds': 120, 'reset_after_seconds': 3600}
         service['observe_only'] = False
         service = api('/services', 'POST', service)
         assert service['observe_only'], 'New service must be observe-only'
@@ -123,6 +124,20 @@ allowed_roots = ["{logs}"]
         start(); ready()
         assert len(detail()['events']) == count
         assert len([r for r in api('/rules') if r['actor'].startswith('service:') and r['enabled'] and (r['expires'] is None or r['expires'] > time.time())]) == 1
+        # Repeat-ban history survives restart and removal of the first rule.
+        append('192.0.2.40')
+        first_actor = f'service:{sid}:policy:{service["policies"][0]["id"]}'
+        value = until(detail, lambda v: any(d['rule'] and d['rule']['actor'] == first_actor and d['rule']['enabled'] and d['hit']['ban_seconds'] == 60 for d in v['decisions']))
+        repeated = next(d['rule'] for d in value['decisions'] if d['rule'] and d['rule']['actor'] == first_actor and d['rule']['enabled'])
+        assert repeated['expires'] - repeated['created'] == 60
+        # The service observe switch overrides enforcing policies, retaining old bans.
+        service['observe_only'] = True
+        service = api(f'/services/{sid}', 'PUT', service)
+        ready()
+        append('192.0.2.60')
+        value = until(detail, lambda v: any(d['hit']['source_ip'] == '192.0.2.60' and d['status'] == 'observe_only' for d in v['decisions']))
+        assert all(d['rule_id'] is None for d in value['decisions'] if d['hit']['source_ip'] == '192.0.2.60')
+        assert len([r for r in api('/rules') if r['actor'].startswith('service:') and r['enabled'] and (r['expires'] is None or r['expires'] > time.time())]) == 2
         # Truncation is explicitly incomplete and clears evidence.
         log.write_text('truncated\n')
         until(detail, lambda v: v['source_health']['ssh-journal']['status'] == 'incomplete')
@@ -133,8 +148,8 @@ allowed_roots = ["{logs}"]
         service = api(f'/services/{sid}', 'PUT', service)
         api(f'/services/{sid}', 'DELETE')
         assert not api('/services')
-        assert len([r for r in api('/rules') if r['actor'].startswith('service:') and r['enabled'] and (r['expires'] is None or r['expires'] > time.time())]) == 1
-        print('Service smoke passed: real file ingestion, shared parsing, two policies, observe/allowlist/enforcement, replay, independent removal, restart deduplication, truncation, emergency disable, deletion.')
+        assert len([r for r in api('/rules') if r['actor'].startswith('service:') and r['enabled'] and (r['expires'] is None or r['expires'] > time.time())]) == 2
+        print('Service smoke passed: real file ingestion, two policies, observe overrides, allowlist/enforcement, replay, independent removal, persistent repeat-ban escalation, restart deduplication, truncation, emergency disable, deletion.')
     finally:
         if process is not None:
             process.terminate()

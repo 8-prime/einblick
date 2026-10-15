@@ -24,6 +24,27 @@
   backend; privileged XDP and actual residential DDNS-provider propagation are
   not part of this check.
 
+## Repeat-ban escalation — 2026-10-15
+
+- Completed optional per-policy escalation with capped durations, persistent
+  service/policy/IP history, interval-based resets, schema-v5 migration with a
+  v4 backup, isolated playground/replay history, and policy editor controls.
+- Fixed saved-policy history cleanup: removing escalation or a policy clears its
+  sequence; reset-interval edits update unexpired history without reviving expired
+  sequences. Observe-only and detection switches preserve unexpired history.
+- **104 Rust tests passed**, with five existing privileged/external/manual checks
+  ignored. Coverage includes restart persistence, reset/cap boundaries, legacy
+  configuration defaults, observe overrides, atomic rollback, policy edits,
+  65,536-entry saturation, and capacity recovery without losing active history.
+  Format, strict Clippy, diff whitespace, Svelte check (zero errors/warnings),
+  four frontend test files, and the production frontend build passed.
+- Both HTTP smoke tests passed against the rebuilt debug server. The service test
+  exercised actual appended file logs, persistent escalation after rule removal
+  and restart, observe overrides, independent bans, replay, and deletion through
+  authenticated HTTP and SQLite using the mock enforcer. It now also runs in CI.
+  The smoke tests needed localhost listeners outside the sandbox. Live XDP and
+  rendered browser checks were not rerun for this change.
+
 ## Service protection — 2026-10-14
 
 - Reviewed and reused the existing Rust/Svelte architecture, bounded SQLite

@@ -233,7 +233,9 @@ at minute boundaries and can lose an unfinished minute on abrupt exit.
 
 Schema upgrades use SQLite's backup API before a transactional migration. A v1
 database saves `<database>.schema-v1-backup`; a v2 database saves
-`<database>.schema-v2-backup`. The current schema is v3. Rules, settings, audit,
+`<database>.schema-v2-backup`; v3 and v4 databases save corresponding
+`<database>.schema-v3-backup` and `<database>.schema-v4-backup` files. The current
+schema is v5, including persistent service repeat-ban history. Rules, settings, audit,
 and existing history remain. Rollback restores the original backup with the
 matching old image. Earlier IP-to-port or application associations cannot be
 reconstructed; capture starts with their respective deployments. Preserve the

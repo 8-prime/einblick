@@ -34,3 +34,5 @@ jobs:
         run: sudo unshare --net -- ./scripts/test-kernel.sh
       - name: Mock HTTP smoke test
         run: EINBLICK_TEST_BINARY="$PWD/target/release/einblick" python3 scripts/smoke-test.py
+      - name: Service protection HTTP smoke test
+        run: EINBLICK_TEST_BINARY="$PWD/target/release/einblick" python3 scripts/service-smoke-test.py

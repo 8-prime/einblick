@@ -90,6 +90,48 @@ pub struct Policy {
     pub threshold: usize,
     pub window_seconds: i64,
     pub ban_seconds: i64,
+    #[serde(default)]
+    pub ban_escalation: Option<BanEscalation>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BanEscalation {
+    pub multiplier: u32,
+    pub max_ban_seconds: i64,
+    pub reset_after_seconds: i64,
+}
+#[derive(Clone, Debug)]
+pub struct BanHistory {
+    pub last_ban: i64,
+    pub ban_count: u32,
+}
+impl Policy {
+    /// Only committed bans advance live history. Simulations use their own history.
+    pub fn next_ban(&self, prior: Option<&BanHistory>, now: i64) -> (i64, BanHistory) {
+        let Some(escalation) = &self.ban_escalation else {
+            return (
+                self.ban_seconds,
+                BanHistory {
+                    last_ban: now,
+                    ban_count: 1,
+                },
+            );
+        };
+        let previous = prior
+            .filter(|h| h.last_ban <= now && now - h.last_ban < escalation.reset_after_seconds)
+            .map_or(0, |h| h.ban_count);
+        let seconds = self
+            .ban_seconds
+            .saturating_mul(i64::from(escalation.multiplier).saturating_pow(previous.min(32)))
+            .min(escalation.max_ban_seconds);
+        (
+            seconds,
+            BanHistory {
+                last_ban: now,
+                ban_count: previous.saturating_add(1).min(32),
+            },
+        )
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SecurityEvent {
@@ -256,6 +298,14 @@ impl ProtectedService {
                     && (1..=604800).contains(&p.ban_seconds),
                 "policy limits: threshold 1–1000, window 1–86400s, ban 1–604800s"
             );
+            if let Some(e) = &p.ban_escalation {
+                ensure!(
+                    (2..=10).contains(&e.multiplier)
+                        && (p.ban_seconds..=604800).contains(&e.max_ban_seconds)
+                        && (1..=31536000).contains(&e.reset_after_seconds),
+                    "escalation limits: multiplier 2–10, maximum ban from base duration to 604800s, reset 1–31536000s"
+                );
+            }
         }
         Ok(())
     }
@@ -502,6 +552,7 @@ pub fn simulate_events(
     let mut engine = PolicyEngine::default();
     let mut result=Simulation{matches:vec![],counts:BTreeMap::new(),decisions:vec![],potentially_preventable:0,source_counts:BTreeMap::new(),filter_counts:BTreeMap::new(),policy_counts:BTreeMap::new(),timing:"Recorded event timestamps; estimates later matching events inside a hypothetical whole-IP ban. Not proof of prevention.".into()};
     let mut bans: HashMap<IpAddr, i64> = HashMap::new();
+    let mut history: HashMap<(String, IpAddr), BanHistory> = HashMap::new();
     for e in events {
         *result.source_counts.entry(e.source_id.clone()).or_default() += 1;
         *result
@@ -512,7 +563,17 @@ pub fn simulate_events(
         if bans.get(&e.source_ip).is_some_and(|until| *until > e.at) {
             result.potentially_preventable += 1;
         }
-        for hit in engine.evaluate(service, &e)? {
+        for mut hit in engine.evaluate(service, &e)? {
+            let policy = service
+                .policies
+                .iter()
+                .find(|p| p.id == hit.policy_id)
+                .unwrap();
+            let key = (hit.policy_id.clone(), hit.source_ip);
+            let (seconds, next) = policy.next_ban(history.get(&key), hit.at);
+            hit.ban_seconds = seconds;
+            history.insert(key.clone(), next);
+            engine.cooldown.insert(key, hit.at + seconds);
             *result
                 .policy_counts
                 .entry(hit.policy_id.clone())
@@ -577,12 +638,109 @@ pub fn playground(
     Ok(result)
 }
 pub fn ssh_template() -> ProtectedService {
-    ProtectedService{id:0,revision:0,name:"OpenSSH".into(),description:"SSH authentication failures. Verify the unit and samples before enabling enforcement. Whole source IP scope.".into(),enabled:true,observe_only:true,scope:BanScope::SourceIp,sources:vec![LogSource{id:"ssh-journal".into(),name:"SSH journal".into(),enabled:true,input:SourceInput::Journal{unit:"ssh.service".into()},filters:vec![Filter{id:"ssh-failures".into(),name:"OpenSSH authentication failures".into(),enabled:true,patterns:vec![r"Failed (?:password|publickey|keyboard-interactive(?:/pam)?) for (?:invalid user )?(?P<subject>\S+) from (?P<source_ip>[0-9a-fA-F:.]+) port \d+".into(),r"Invalid user (?P<subject>\S+) from (?P<source_ip>[0-9a-fA-F:.]+) port \d+".into(),r"authentication failure;.*rhost=(?P<source_ip>[0-9a-fA-F:.]+)(?:\s+user=(?P<subject>\S+))?".into()],event_type:"authentication_failure".into(),ip_capture:ip_capture(),subject_capture:Some("subject".into()),timestamp_capture:None}]}],policies:vec![Policy{id:"ssh-brute-force".into(),name:"Repeated authentication failures".into(),enabled:true,observe_only:true,event_types:vec!["authentication_failure".into()],threshold:5,window_seconds:300,ban_seconds:600}]}
+    ProtectedService{id:0,revision:0,name:"OpenSSH".into(),description:"SSH authentication failures. Verify the unit and samples before enabling enforcement. Whole source IP scope.".into(),enabled:true,observe_only:true,scope:BanScope::SourceIp,sources:vec![LogSource{id:"ssh-journal".into(),name:"SSH journal".into(),enabled:true,input:SourceInput::Journal{unit:"ssh.service".into()},filters:vec![Filter{id:"ssh-failures".into(),name:"OpenSSH authentication failures".into(),enabled:true,patterns:vec![r"Failed (?:password|publickey|keyboard-interactive(?:/pam)?) for (?:invalid user )?(?P<subject>\S+) from (?P<source_ip>[0-9a-fA-F:.]+) port \d+".into(),r"Invalid user (?P<subject>\S+) from (?P<source_ip>[0-9a-fA-F:.]+) port \d+".into(),r"authentication failure;.*rhost=(?P<source_ip>[0-9a-fA-F:.]+)(?:\s+user=(?P<subject>\S+))?".into()],event_type:"authentication_failure".into(),ip_capture:ip_capture(),subject_capture:Some("subject".into()),timestamp_capture:None}]}],policies:vec![Policy{id:"ssh-brute-force".into(),name:"Repeated authentication failures".into(),enabled:true,observe_only:true,event_types:vec!["authentication_failure".into()],threshold:5,window_seconds:300,ban_seconds:600,ban_escalation:None}]}
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn escalation_defaults_bounds_and_saturated_history() {
+        let mut service = ssh_template();
+        let mut json = serde_json::to_value(&service).unwrap();
+        json["policies"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("ban_escalation");
+        let legacy: ProtectedService = serde_json::from_value(json).unwrap();
+        assert!(legacy.policies[0].ban_escalation.is_none());
+        for (multiplier, max_ban_seconds, reset_after_seconds, valid) in [
+            (2, 600, 1, true),
+            (10, 604800, 31536000, true),
+            (1, 600, 1, false),
+            (11, 600, 1, false),
+            (2, 599, 1, false),
+            (2, 604801, 1, false),
+            (2, 600, 0, false),
+            (2, 600, 31536001, false),
+        ] {
+            service.policies[0].ban_escalation = Some(BanEscalation {
+                multiplier,
+                max_ban_seconds,
+                reset_after_seconds,
+            });
+            assert_eq!(service.validate().is_ok(), valid);
+        }
+        let policy = &mut service.policies[0];
+        policy.ban_escalation = Some(BanEscalation {
+            multiplier: 10,
+            max_ban_seconds: 604800,
+            reset_after_seconds: 100,
+        });
+        let history = BanHistory {
+            last_ban: 100,
+            ban_count: u32::MAX,
+        };
+        let (seconds, next) = policy.next_ban(Some(&history), 101);
+        assert_eq!(seconds, 604800);
+        assert_eq!(next.ban_count, 32);
+        assert_eq!(policy.next_ban(Some(&history), 200).0, 600);
+        assert_eq!(policy.next_ban(Some(&history), 99).0, 600);
+    }
+    #[test]
+    fn observe_only_either_flag_overrides_enforcement() {
+        let mut service = ssh_template();
+        service.policies[0].threshold = 1;
+        for (service_observe, policy_observe) in
+            [(true, true), (true, false), (false, true), (false, false)]
+        {
+            service.observe_only = service_observe;
+            service.policies[0].observe_only = policy_observe;
+            let result = playground(
+                &service,
+                "ssh-journal",
+                "Failed password for root from 192.0.2.1 port 44",
+                100,
+                1,
+            )
+            .unwrap();
+            assert_eq!(
+                result.decisions[0].observe_only,
+                service_observe || policy_observe
+            );
+        }
+    }
+    #[test]
+    fn repeat_ban_simulation_caps_resets_and_separates_ips() {
+        let mut service = ssh_template();
+        let p = &mut service.policies[0];
+        p.threshold = 1;
+        p.ban_seconds = 10;
+        p.ban_escalation = Some(BanEscalation {
+            multiplier: 2,
+            max_ban_seconds: 30,
+            reset_after_seconds: 100,
+        });
+        service.sources[0].filters[0].patterns = vec![r"(?P<at>\d+) (?P<source_ip>\S+)".into()];
+        service.sources[0].filters[0].subject_capture = None;
+        service.sources[0].filters[0].timestamp_capture = Some("at".into());
+        let result = playground(&service, "ssh-journal", "100 192.0.2.1\n101 192.0.2.1\n110 192.0.2.1\n120 192.0.2.1\n130 192.0.2.1\n160 192.0.2.1\n161 192.0.2.2\n260 192.0.2.1", 100, 1).unwrap();
+        assert_eq!(
+            result
+                .decisions
+                .iter()
+                .map(|h| h.ban_seconds)
+                .collect::<Vec<_>>(),
+            [10, 20, 30, 30, 10, 10]
+        );
+        assert_eq!(result.potentially_preventable, 2);
+        service.policies[0]
+            .ban_escalation
+            .as_mut()
+            .unwrap()
+            .max_ban_seconds = 9;
+        assert!(service.validate().is_err());
+    }
     #[test]
     fn ssh_variants_and_extraction() {
         let s = ssh_template();
