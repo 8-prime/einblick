@@ -21,11 +21,24 @@ no bearer API tokens or multiple roles are included in this MVP.
 | GET | `/events` | `limit` (default 100, max 200), `before` exclusive event ID cursor, optional exact source `ip`; newest first; 4 MiB data limit |
 | GET | `/traffic` | Traffic detail across sources; combined filters and pagination below |
 | GET | `/sources/{ip}/traffic` | Source association detail; parameters and response below |
+| GET | `/sources/{ip}/caddy` | Caddy request evidence for an exact direct remote IP; optional `from`/`to` Unix seconds (default last day, max 90 days), `limit` (1–200, default 100), `cursor` |
+| GET | `/caddy/status` | Caddy polling configuration and per-source ingestion status |
 
 Login requires an `Origin` matching `public_origin`. All other routes require the
 `einblick_session` cookie. Mutations also require `X-CSRF-Token` and matching Origin.
 SSE ends when the session becomes invalid or the server shuts down; reconnect and
 refetch `/snapshot` after a `resync`. Sessions are lost on server restart.
+
+Caddy responses contain `application: "Caddy"`, `attribution: "caddy_access_log"`,
+`enabled`, `poll_seconds`, `retention_days`, `sources`, `rows`, and `next_cursor`.
+Each row contains `id`, `at`, `remote_ip`, optional `client_ip`, `host`, `path`,
+`method`, `status`, and `log_path`. Rows sort newest timestamp/ID first. Pass the
+opaque `next_cursor` with the same IP/range for the next page. Each source contains
+`log_path`, `last_poll`, `last_success`, cumulative `skipped` and `gaps`, and
+`error`; private file cursors are excluded. `/caddy/status` returns empty rows.
+This evidence does not change packet/application counters. Queries use the direct
+peer, not a forwarded client IP; paths exclude query strings/fragments. See
+[Caddy setup and recovery](CADDY.md).
 
 `kind` is `allow` or `block`. Use an explicit CIDR, including `/32` or `/128` for an
 individual address. Networks are canonicalized. `seconds: null` is permanent;

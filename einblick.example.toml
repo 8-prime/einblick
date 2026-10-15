@@ -72,3 +72,12 @@ event_days = 90
 [service_logs]
 allowed_roots = [] # e.g. ["/host/logs"]
 journal_directory = "" # e.g. "/host/journal" (journalctl is included in the image)
+
+# Optional Caddy JSON access logs. Mount the log directory read-only and add
+# "/host/caddy" to service_logs.allowed_roots above. See docs/CADDY.md.
+[caddy]
+enabled = false
+log_paths = [] # e.g. ["/host/caddy/access.json"]
+poll_seconds = 5
+retention_days = 7
+row_limit = 100000

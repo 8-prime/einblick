@@ -216,6 +216,12 @@ application changes on a port. Counts are not divided among candidates, and
 ownership does not prove delivery. See [application attribution](docs/APPLICATION_ATTRIBUTION.md)
 for deployment, Docker access, configured labels, coverage, and limits.
 
+The optional [Caddy integration](docs/CADDY.md) periodically imports JSON access
+logs and adds **Caddy · HTTP requests** to the IP inspector: requested domains,
+paths, methods, statuses, and times. It preserves cursors across restarts and
+reports ingestion health. Enable `[caddy]` and mount its log directory read-only;
+query strings and headers are omitted from stored request evidence.
+
 IP detail includes low-volume sources outside the top-100 summary, within
 `association_capacity` (4,096 per bank) and `detail_minute_capacity` (16,384 distinct
 groups per minute). Detail uses the configured seven-day minute and 90-day hourly
@@ -234,8 +240,9 @@ at minute boundaries and can lose an unfinished minute on abrupt exit.
 Schema upgrades use SQLite's backup API before a transactional migration. A v1
 database saves `<database>.schema-v1-backup`; a v2 database saves
 `<database>.schema-v2-backup`; v3 and v4 databases save corresponding
-`<database>.schema-v3-backup` and `<database>.schema-v4-backup` files. The current
-schema is v5, including persistent service repeat-ban history. Rules, settings, audit,
+`<database>.schema-v3-backup` and `<database>.schema-v4-backup` files. V5 databases
+save `<database>.schema-v5-backup`. The current schema is v6, including Caddy
+request evidence and persistent service repeat-ban history. Rules, settings, audit,
 and existing history remain. Rollback restores the original backup with the
 matching old image. Earlier IP-to-port or application associations cannot be
 reconstructed; capture starts with their respective deployments. Preserve the

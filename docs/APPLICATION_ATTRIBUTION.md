@@ -193,8 +193,9 @@ changes. Mock/demo configurations include labels for synthetic services.
 - TCP client connections are not collected yet. Some bound/connected UDP sockets
   provide candidates for incoming replies. Exact flow attribution and outbound
   counters need additional capture.
-- Reverse-proxy processes are visible; identifying their upstream apps requires
-  logs. Remote software is not identified. Unknown ports are not assigned names
+- Reverse-proxy processes are visible. The optional [Caddy integration](CADDY.md)
+  adds per-IP host/path request evidence in the IP inspector; it does not identify
+  upstream apps. Remote software is not identified. Unknown ports are not assigned names
   guessed from conventional port numbers.
 - Unsupported transport, denied access, absent owners, stale evidence, saturation,
   and uncollected history are explicit reasons in rows and/or Health.

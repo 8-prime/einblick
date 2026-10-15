@@ -102,6 +102,8 @@ pub fn router(app: App) -> Router {
         .route("/history", get(history))
         .route("/analytics", get(analytics))
         .route("/sources/{ip}/traffic", get(source_traffic))
+        .route("/sources/{ip}/caddy", get(source_caddy))
+        .route("/caddy/status", get(caddy_status))
         .route("/traffic", get(traffic_query))
         .route("/events", get(events))
         .route("/rules", get(rules).post(add_rule))
@@ -285,6 +287,69 @@ struct SourceTrafficQuery {
     port: Option<u16>,
     cursor: Option<String>,
     limit: Option<usize>,
+}
+
+async fn caddy_status(State(app): State<App>) -> Result<Json<caddy::CaddyPage>, ApiError> {
+    let mut sources = Vec::new();
+    for path in &app.config.caddy.log_paths {
+        sources.push(app.db.caddy_source(path.clone()).await?);
+    }
+    Ok(Json(caddy::CaddyPage {
+        application: "Caddy",
+        attribution: "caddy_access_log",
+        enabled: app.config.caddy.enabled,
+        poll_seconds: app.config.caddy.poll_seconds,
+        retention_days: app.config.caddy.retention_days,
+        sources,
+        rows: vec![],
+        next_cursor: None,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaddyQuery {
+    from: Option<i64>,
+    to: Option<i64>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+async fn source_caddy(
+    State(app): State<App>,
+    Path(ip): Path<String>,
+    Query(q): Query<CaddyQuery>,
+) -> Result<Json<caddy::CaddyPage>, ApiError> {
+    let ip = ip
+        .parse::<IpAddr>()
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid IP address".into()))?
+        .to_canonical();
+    if q.cursor.as_ref().is_some_and(|s| s.len() > 128) {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "Caddy cursor too long".into(),
+        ));
+    }
+    let before = q
+        .cursor
+        .map(|s| serde_json::from_str::<(i64, i64)>(&s))
+        .transpose()
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid Caddy cursor".into()))?;
+    let now = unix_now();
+    let (rows, next_cursor) = app
+        .db
+        .caddy_requests(
+            ip,
+            q.from.unwrap_or(now - 86400),
+            q.to.unwrap_or(now),
+            before,
+            q.limit.unwrap_or(100),
+        )
+        .await?;
+    let Json(mut page) = caddy_status(State(app)).await?;
+    page.rows = rows;
+    page.next_cursor = next_cursor;
+    Ok(Json(page))
 }
 async fn source_traffic(
     State(app): State<App>,

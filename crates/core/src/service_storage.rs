@@ -673,7 +673,7 @@ mod tests {
         let db = Database::open(name).unwrap();
         let service = db.save_service(ssh_template(), true, 100).await.unwrap();
         db.call(|c| {
-            c.execute_batch("DROP TABLE service_ban_history;PRAGMA user_version=4;")?;
+            c.execute_batch("DROP TABLE caddy_requests;DROP TABLE caddy_sources;DROP TABLE service_ban_history;PRAGMA user_version=4;")?;
             Ok(())
         })
         .await
@@ -684,7 +684,7 @@ mod tests {
         db.call(|c| {
             assert_eq!(
                 c.pragma_query_value(None, "user_version", |r| r.get::<_, i64>(0))?,
-                5
+                6
             );
             Ok(())
         })
@@ -848,7 +848,7 @@ mod tests {
         ));
         let name = path.to_str().unwrap();
         let db = Database::open(name).unwrap();
-        db.call(|c| {c.execute_batch("DROP TABLE service_ban_history;DROP TABLE service_sources;DROP TABLE security_events;DROP TABLE service_decisions;DROP TABLE protected_services;PRAGMA user_version=3;")?;Ok(())}).await.unwrap();
+        db.call(|c| {c.execute_batch("DROP TABLE caddy_requests;DROP TABLE caddy_sources;DROP TABLE service_ban_history;DROP TABLE service_sources;DROP TABLE security_events;DROP TABLE service_decisions;DROP TABLE protected_services;PRAGMA user_version=3;")?;Ok(())}).await.unwrap();
         drop(db);
         let db = Database::open(name).unwrap();
         let service = db.save_service(ssh_template(), true, 100).await.unwrap();

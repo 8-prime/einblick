@@ -32,6 +32,29 @@ pub struct Config {
     pub applications: ApplicationConfig,
     pub ip_enrichment: IpEnrichmentConfig,
     pub service_logs: ServiceLogConfig,
+    pub caddy: CaddyConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CaddyConfig {
+    pub enabled: bool,
+    pub log_paths: Vec<String>,
+    pub poll_seconds: u64,
+    pub retention_days: i64,
+    pub row_limit: usize,
+}
+
+impl Default for CaddyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            log_paths: vec![],
+            poll_seconds: 5,
+            retention_days: 7,
+            row_limit: 100_000,
+        }
+    }
 }
 
 /// Management exemptions accept literal networks, individual IPs, or DNS names.
@@ -221,6 +244,7 @@ impl Default for Config {
             applications: ApplicationConfig::default(),
             ip_enrichment: IpEnrichmentConfig::default(),
             service_logs: ServiceLogConfig::default(),
+            caddy: CaddyConfig::default(),
         }
     }
 }
@@ -231,6 +255,36 @@ impl Config {
         Ok(c)
     }
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (1..=3600).contains(&self.caddy.poll_seconds)
+                && (1..=90).contains(&self.caddy.retention_days)
+                && (128..=1_000_000).contains(&self.caddy.row_limit),
+            "invalid Caddy polling or retention limits"
+        );
+        ensure!(
+            self.caddy.log_paths.len() <= 16
+                && (!self.caddy.enabled || !self.caddy.log_paths.is_empty()),
+            "Caddy requires 1–16 log paths when enabled"
+        );
+        let mut paths = std::collections::HashSet::new();
+        for path in &self.caddy.log_paths {
+            let p = Path::new(path);
+            ensure!(
+                p.is_absolute()
+                    && path.len() <= 4096
+                    && !p.components().any(|c| matches!(
+                        c,
+                        std::path::Component::ParentDir | std::path::Component::CurDir
+                    ))
+                    && paths.insert(path)
+                    && self
+                        .service_logs
+                        .allowed_roots
+                        .iter()
+                        .any(|root| p.starts_with(root) && p != Path::new(root)),
+                "Caddy log paths must be unique absolute files under service_logs.allowed_roots"
+            );
+        }
         ensure!(
             self.service_logs.allowed_roots.len() <= 16,
             "too many log roots"
@@ -410,6 +464,38 @@ impl ApplicationConfig {
 #[cfg(test)]
 mod management_tests {
     use super::*;
+
+    #[test]
+    fn caddy_requires_explicit_paths_and_bounded_polling() {
+        let mut config = Config {
+            mock: true,
+            ..Config::default()
+        };
+        config.validate().unwrap();
+        config.caddy.enabled = true;
+        assert!(config.validate().is_err());
+        config.caddy.log_paths = vec!["/host/caddy/access.json".into()];
+        assert!(config.validate().is_err());
+        config.service_logs.allowed_roots = vec!["/host/caddy".into()];
+        config.validate().unwrap();
+        for path in [
+            "/host/caddy/../private",
+            "/host/caddy-other/access.json",
+            "/host/caddy",
+            "relative.json",
+        ] {
+            config.caddy.log_paths = vec![path.into()];
+            assert!(config.validate().is_err(), "accepted {path}");
+        }
+        config.caddy.log_paths = vec!["/host/caddy/access.json".into(); 2];
+        assert!(config.validate().is_err());
+        config.caddy.log_paths.truncate(1);
+        config.caddy.poll_seconds = 0;
+        assert!(config.validate().is_err());
+        config.caddy.poll_seconds = 5;
+        config.caddy.retention_days = 91;
+        assert!(config.validate().is_err());
+    }
 
     #[test]
     fn management_entries_accept_cidrs_ips_and_normalized_hostnames() {

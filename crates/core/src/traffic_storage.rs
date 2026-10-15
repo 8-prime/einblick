@@ -571,7 +571,7 @@ mod tests {
         )
         .await
         .unwrap();
-        old.call(|c| { c.execute_batch("DROP TABLE traffic_applications;DROP INDEX traffic_application_lookup;DROP TABLE service_ban_history;DROP TABLE service_sources;DROP TABLE security_events;DROP TABLE service_decisions;DROP TABLE protected_services;PRAGMA user_version=2;")?;Ok(()) }).await.unwrap();
+        old.call(|c| { c.execute_batch("DROP TABLE caddy_requests;DROP TABLE caddy_sources;DROP TABLE traffic_applications;DROP INDEX traffic_application_lookup;DROP TABLE service_ban_history;DROP TABLE service_sources;DROP TABLE security_events;DROP TABLE service_decisions;DROP TABLE protected_services;PRAGMA user_version=2;")?;Ok(()) }).await.unwrap();
         drop(old);
         let upgraded = Database::open(name).unwrap();
         let page = upgraded

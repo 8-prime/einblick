@@ -3,6 +3,7 @@ mod api;
 mod applications;
 mod auth;
 mod backend;
+mod caddy;
 mod ip_enrichment;
 mod management;
 mod monitor;
@@ -93,6 +94,7 @@ async fn run(
         commands.clone(),
         stop.subscribe(),
     ));
+    let caddy_worker = tokio::spawn(caddy::run(config.clone(), db.clone(), stop.subscribe()));
     let enrichment = ip_enrichment::Enrichment::start(&config, stop.subscribe());
     let mut monitor = monitor::Monitor::new(
         config.clone(),
@@ -148,5 +150,6 @@ async fn run(
         result=&mut server=>{let _=stop.send(());worker.await?;result?;},
     }
     let _ = tokio::time::timeout(std::time::Duration::from_secs(4), service_worker).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(4), caddy_worker).await;
     Ok(())
 }

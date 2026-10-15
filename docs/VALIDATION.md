@@ -1,5 +1,30 @@
 # Implementation validation — 2026-10-12
 
+## Caddy request attribution — 2026-10-15
+
+- Added opt-in periodic JSON access-log ingestion, persistent transactional file
+  positions/request evidence, bounded reads, rotation/truncation handling, skipped
+  record health, configurable retention/row limits, authenticated per-IP paging,
+  and IP-inspector/Health panels. Source attribution uses the direct remote peer;
+  forwarded client IP stays separate. Query strings and headers are not stored.
+- **121 Rust tests passed**, with five existing privileged/external/manual checks
+  ignored. Coverage includes parser/IP/timestamp normalization, invalid and large
+  records, partial lines, restart/rotation/truncation, IP isolation, cursor
+  deduplication/paging, retention/caps, config validation, and v5 migration backup.
+  Rust format, strict Clippy, diff whitespace, Svelte check (zero errors/warnings),
+  four frontend test files, and the production frontend build passed.
+- The new `scripts/caddy-smoke-test.py` passed against the rebuilt debug server:
+  actual background polling, initial import/appends, auth and invalid queries,
+  IPv4/IPv6 isolation, Caddy labels/domain/path fields, query/header omission,
+  pagination, rotation, truncation, restart deduplication, and readable error health
+  without changing readiness. It runs in CI alongside existing smoke tests.
+- Existing network/application and service-protection HTTP smoke tests also passed.
+  Socket/HTTP fixtures required execution outside the sandbox for localhost access.
+  No live Caddy deployment or Docker image build was used; the fixture matches
+  Caddy's documented JSON fields. Browser surfaces were unavailable, so rendered
+  browser interaction was not verified. Packet capture/XDP code is unchanged.
+- Setup and limits: [CADDY.md](CADDY.md); endpoints: [API.md](API.md).
+
 ## Management DNS — 2026-10-14
 
 - Management configuration accepts CIDRs, literal IPv4/IPv6 addresses, and

@@ -31,6 +31,9 @@ services:
       # For rotation, mount its containing directory instead of one file:
       # - /var/log:/host/logs:ro
       # - /var/log/journal:/host/journal:ro
+      # Optional Caddy HTTP request attribution. Mount the directory so log
+      # rotation remains visible; configure [caddy] and service_logs.allowed_roots.
+      # - /var/log/caddy:/host/caddy:ro
       # Volatile journals: /run/log/journal:/host/journal:ro instead.
       # Optional Docker published-port/NAT attribution. Also set
       # applications.docker_socket = "/var/run/docker.sock" in einblick.toml.
